@@ -10,15 +10,20 @@ ZERO_HASH = '0'*64
 @dataclass
 class Config:
     num_validators: int
+    max_checkpoint_interval_for_backoff: int
+
+@dataclass
+class Checkpoint:
+    hash: str
+    chain_slot: int
+    checkpoint_slot: int
 
 # Blockchain state
 @dataclass
 class State:
     config: Config
-    latest_justified_hash: str
-    latest_justified_slot: int
-    latest_finalized_hash: str
-    latest_finalized_slot: int
+    latest_justified: Checkpoint
+    latest_finalized: Checkpoint
     historical_block_hashes: List[str] = field(default_factory=list)
     justified_slots: List[bool] = field(default_factory=list)
     justifications: Dict[str, List[bool]] = field(default_factory=dict)
@@ -29,11 +34,8 @@ class Vote:
     validator_id: int
     slot: int
     head: str
-    head_slot: int
-    target: str
-    target_slot: int
-    source: str
-    source_slot: int
+    source: Optional[Checkpoint] = None
+    target: Optional[Checkpoint] = None
 
 # A block
 @dataclass
@@ -52,14 +54,11 @@ def compute_hash(obj: object):
 # We allow justification of slots either <= 5 or a perfect square or oblong after
 # the latest finalized slot. This gives us a backoff technique and ensures
 # finality keeps progressing even under high latency
-def is_justifiable_slot(finalized_slot: int, candidate: int):
+def is_justifiable_slot(config: Config, finalized_slot: int, candidate: int):
     assert candidate >= finalized_slot
     delta = candidate - finalized_slot
-    return (
-        delta <= 5
-        or (delta ** 0.5) % 1 == 0            # any x^2
-        or ((delta + 0.25) ** 0.5) % 1 == 0.5 # any x^2+x
-    )
+    checkpoint_interval = min(2**(delta // 8), config.max_checkpoint_interval_for_backoff)
+    return candidate % checkpoint_interval == 0
 
 # Given a state, output the new state after processing that block
 def process_block(state: State, block: Block) -> State:
@@ -72,53 +71,53 @@ def process_block(state: State, block: Block) -> State:
         state.historical_block_hashes.append(None)
     # Process votes
     for vote in block.votes:
-        # Ignore votes whose source is not already justified,
-        # or whose target is not in the history, or whose target is not a
+        # Ignore votes without a source or target, or with source later than
+        # the latest finalized slot or not already justified, or whose target
+        # or source is not in the history, or whose target is not a
         # valid justifiable slot
         if (
-            state.justified_slots[vote.source_slot] is False
-            or vote.source != state.historical_block_hashes[vote.source_slot]
-            or vote.target != state.historical_block_hashes[vote.target_slot]
-            or vote.target_slot <= vote.source_slot
-            or not is_justifiable_slot(state.latest_finalized_slot, vote.target_slot)
+            vote.source is None or vote.target is None
+            or vote.source.checkpoint_slot < state.latest_finalized.checkpoint_slot
+            or state.justified_slots[vote.source.checkpoint_slot] is False
+            or vote.source.hash != state.historical_block_hashes[vote.source.chain_slot]
+            or vote.target.hash != state.historical_block_hashes[vote.target.chain_slot]
+            or vote.target.checkpoint_slot <= vote.source.checkpoint_slot
+            or not is_justifiable_slot(state.config, state.latest_finalized.checkpoint_slot, vote.target.checkpoint_slot)
         ):
             continue
 
         # Track attempts to justify new hashes
-        if vote.target not in state.justifications:
-            state.justifications[vote.target] = [False] * state.config.num_validators
+        if vote.target.hash not in state.justifications:
+            state.justifications[vote.target.hash] = [False] * state.config.num_validators
 
-        if not state.justifications[vote.target][vote.validator_id]:
-            state.justifications[vote.target][vote.validator_id] = True
+        if not state.justifications[vote.target.hash][vote.validator_id]:
+            state.justifications[vote.target.hash][vote.validator_id] = True
 
-        count = sum(state.justifications[vote.target])
+        count = sum(state.justifications[vote.target.hash])
 
         # If 2/3 voted for the same new valid hash to justify
         if count == (2 * state.config.num_validators) // 3:
-            state.latest_justified_hash = vote.target
-            state.latest_justified_slot = vote.target_slot
-            state.justified_slots[vote.target_slot] = True
-            del state.justifications[vote.target]
+            state.latest_justified = vote.target
+            state.justified_slots[vote.target.checkpoint_slot] = True
+            del state.justifications[vote.target.hash]
 
             # Finalization: if the target is the next valid justifiable
             # hash after the source
             if not any(
-                is_justifiable_slot(state.latest_finalized_slot, slot)
-                for slot in range(vote.source_slot + 1, vote.target_slot)
+                is_justifiable_slot(state.config, state.latest_finalized.checkpoint_slot, slot)
+                for slot in range(vote.source.checkpoint_slot + 1, vote.target.checkpoint_slot)
             ):
-                state.latest_finalized_hash = vote.source
-                state.latest_finalized_slot = vote.source_slot
+                state.latest_finalized = vote.source
 
     return state
 
 # Get the highest-slot justified block that we know about
-def get_latest_justified_hash(post_states: Dict[str, State]) -> str:
-    latest = max(
+def get_latest_justified_checkpoint(post_states: Dict[str, State]) -> Checkpoint:
+    latest = max(   
         post_states.values(),
-        key=lambda s: s.latest_justified_slot
+        key=lambda s: s.latest_justified.checkpoint_slot
     )
-    return latest.latest_justified_hash
-
+    return latest.latest_justified
 
 # Use LMD GHOST to get the head, given a particular root (usually the
 # latest known justified block)

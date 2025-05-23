@@ -3,8 +3,8 @@ import heapq
 from typing import List, Dict, Union, Optional, Set
 import copy
 from consensus import (
-    State, Vote, Block,
-    process_block, get_latest_justified_hash, get_fork_choice_head,
+    State, Vote, Block, Checkpoint,
+    process_block, get_latest_justified_checkpoint, get_fork_choice_head,
     compute_hash, is_justifiable_slot
 )
 from collections import defaultdict
@@ -14,7 +14,7 @@ ZERO_HASH = '0'*64
 
 # A basic Staker node implementation
 class Staker:
-    def __init__(self, validator_id: int, network: 'P2PNetwork', genesis_block: Block, genesis_state: State):
+    def __init__(self, validator_id: int, network: 'P2PNetwork', genesis_block: Block, genesis_state: State, use_backoff: bool = True):
         # This node's validator ID
         self.validator_id = validator_id
         # Hook to the p2p network
@@ -38,21 +38,27 @@ class Staker:
         self.safe_target: Block = None
         # Head of the chain
         self.head = self.genesis_hash
+        # Whether to use k-th ancestor backoff
+        self.use_backoff = use_backoff
         # Join the p2p network
         self.network.register_staker(self)
 
     @property
-    def latest_justified_hash(self):
-        return get_latest_justified_hash(self.post_states)
+    def latest_justified(self):
+        return get_latest_justified_checkpoint(self.post_states)
 
     @property
-    def latest_finalized_hash(self):
-        return self.post_states[self.head].latest_finalized_hash
+    def latest_finalized(self):
+        latest = max(   
+            self.post_states.values(),
+            key=lambda s: s.latest_finalized.checkpoint_slot
+        )
+        return latest.latest_finalized
 
     # Compute the latest block that the staker is allowed to choose
     # as the target
     def compute_safe_target(self):
-        justified_hash = get_latest_justified_hash(self.post_states)
+        justified_hash = self.latest_justified.hash
         return get_fork_choice_head(
             self.chain,
             justified_hash,
@@ -71,7 +77,7 @@ class Staker:
 
     # Done upon processing new votes or a new block
     def recompute_head(self):
-        justified_hash = get_latest_justified_hash(self.post_states)
+        justified_hash = self.latest_justified.hash
         self.head = get_fork_choice_head(self.chain, justified_hash, self.known_votes)
 
     # Called every second
@@ -117,8 +123,10 @@ class Staker:
             state = process_block(head_state, new_block)
             new_votes_to_add = [
                 vote for vote in self.known_votes if
-                vote.source == state.latest_justified_hash and
-                vote not in votes_to_add
+                (
+                    vote.source is None or
+                    vote.source.checkpoint_slot >= state.latest_finalized.checkpoint_slot
+                ) and vote not in votes_to_add
             ]
 
             if len(new_votes_to_add) == 0:
@@ -133,32 +141,54 @@ class Staker:
 
         self.network.submit(new_block, self.validator_id)
 
+    def get_target_block(self):
+        state = self.post_states[self.head]
+        target_block = self.chain[self.head]
+        # If using backoff and finalized slot is > 32 slots in the past, use genesis as safe target
+        if self.use_backoff and self.get_current_slot() - state.latest_finalized.checkpoint_slot > 32:
+            safe_target = self.genesis_hash
+        else:
+            safe_target = self.safe_target or self.genesis_hash
+            
+        # If there is no very recent safe target, then vote for the block k slots deep
+        while (
+            target_block.slot > self.chain[safe_target].slot 
+            and target_block.slot > self.get_current_slot() - 32
+        ):
+                target_block = self.chain[target_block.parent]
+
+        return target_block
+    
+
     # Called when it's the staker's turn to vote
     def vote(self):
         state = self.post_states[self.head]
-        target_block = self.chain[self.head]
-        safe_target = self.safe_target or self.genesis_hash
-        # If there is no very recent safe target, then vote for the k'th ancestor
-        # of the head
-        for i in range(3):
-            if target_block.slot > self.chain[safe_target].slot:
-                target_block = self.chain[target_block.parent]
-        # If the latest finalized slot is very far back, then only some slots are
-        # valid to justify, make sure the target is one of those
-        while not is_justifiable_slot(state.latest_finalized_slot, target_block.slot):
-            target_block = self.chain[target_block.parent]
+        slot = self.get_current_slot()
 
-        vote = Vote(
-            validator_id=self.validator_id,
-            slot=self.get_current_slot(),
-            head=self.head,
-            head_slot=self.chain[self.head].slot,
-            target=compute_hash(target_block),
-            target_slot=target_block.slot,
-            source=state.latest_justified_hash,
-            source_slot=state.latest_justified_slot
-        )
-        # print('voting, head =', self.chain[self.head].slot, 't', target_block.slot, 's', state.latest_justified_slot)
+        # Create vote with just head if slot is not justifiable
+        if not is_justifiable_slot(state.config, self.latest_finalized.checkpoint_slot, slot):
+            vote = Vote(
+                validator_id=self.validator_id,
+                slot=slot,
+                head=self.head
+            )
+        else:
+            # Create vote with source and target for justifiable slots
+            target_block = self.get_target_block()
+            target = Checkpoint(
+                hash=compute_hash(target_block),
+                chain_slot=target_block.slot,
+                checkpoint_slot=slot
+            )
+            vote = Vote(
+                validator_id=self.validator_id,
+                slot=slot,
+                head=self.head,
+                source=self.latest_justified,
+                target=target
+            )
+        
+        # print('voting, head =', self.chain[self.head].slot, 't', target_block.slot, 's', state.latest_justified.checkpoint_slot)
         self.receive(vote)
         self.network.submit(vote, self.validator_id)
 
