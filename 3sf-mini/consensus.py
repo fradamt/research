@@ -1,22 +1,22 @@
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict
+from enum import Enum
+from typing import Optional, List, Dict, Tuple
 import hashlib
 import json
 import copy
 
 ZERO_HASH = '0'*64
+MAX_BACKOFF_INTERVAL = 8
 
 # Chain configuration
 @dataclass
 class Config:
     num_validators: int
-    max_checkpoint_interval_for_backoff: int
 
-@dataclass
+@dataclass(frozen=True)
 class Checkpoint:
     hash: str
-    chain_slot: int
-    checkpoint_slot: int
+    slot: int
 
 # Blockchain state
 @dataclass
@@ -25,17 +25,22 @@ class State:
     latest_justified: Checkpoint
     latest_finalized: Checkpoint
     historical_block_hashes: List[str] = field(default_factory=list)
-    justified_slots: List[bool] = field(default_factory=list)
+    justified_checkpoints: List[Checkpoint] = field(default_factory=list)
     justifications: Dict[str, List[bool]] = field(default_factory=dict)
+
+class BackoffType(Enum):
+    JUSTIFICATION = "justification"
+    VOTING = "voting"
 
 # A vote. In a live implementation this would also include a signature
 @dataclass
 class Vote:
     validator_id: int
-    slot: int
     head: str
-    source: Optional[Checkpoint] = None
-    target: Optional[Checkpoint] = None
+    finalized_slot: int
+    source: Checkpoint
+    target: Checkpoint
+    target_block_slot: int
 
 # A block
 @dataclass
@@ -48,66 +53,83 @@ class Block:
 # Stub for computing block hash, state root...
 # (in real life replace with SSZ hashing)
 def compute_hash(obj: object):
-    serialized = json.dumps(asdict(obj), sort_keys=True).encode()
+    if isinstance(obj, tuple):
+        serialized = json.dumps([asdict(item) if hasattr(item, '__dataclass_fields__') else item for item in obj], sort_keys=True).encode()
+    else:
+        serialized = json.dumps(asdict(obj), sort_keys=True).encode()
     return hashlib.sha256(serialized).hexdigest()
 
-# We allow justification of slots either <= 5 or a perfect square or oblong after
-# the latest finalized slot. This gives us a backoff technique and ensures
-# finality keeps progressing even under high latency
-def is_justifiable_slot(config: Config, finalized_slot: int, candidate: int):
-    assert candidate >= finalized_slot
-    delta = candidate - finalized_slot
-    checkpoint_interval = min(2**(delta // 8), config.max_checkpoint_interval_for_backoff)
-    return candidate % checkpoint_interval == 0
+def compute_backoff_interval(finalized_slot: int, slot: int, backoff_type: BackoffType):
+    assert slot >= finalized_slot
+    delta = slot - finalized_slot
+    max_backoff_interval = MAX_BACKOFF_INTERVAL // (2 if backoff_type == BackoffType.VOTING else 1)
+    return min(2**(delta // 4), max_backoff_interval)
+
+# Determines if a candidate slot is justifiable based on an exponential backoff mechanism (with a cap).
+# A checkpoint_interval is calculated based on the distance from the last finalized slot, and a slot
+#  is justifiable only if it is a multiple. The mechanism helps finality progress under high latency.
+def is_justifiable_slot(finalized_slot: int, target_slot: int):
+    backoff_interval = compute_backoff_interval(finalized_slot, target_slot, BackoffType.JUSTIFICATION)
+    return target_slot % backoff_interval == 0
+
+def is_voting_slot(finalized_slot: int, slot: int):
+    backoff_interval = compute_backoff_interval(finalized_slot, slot, BackoffType.VOTING)
+    return slot % backoff_interval == 0
+
 
 # Given a state, output the new state after processing that block
 def process_block(state: State, block: Block) -> State:
     state = copy.deepcopy(state)
     # Track historical blocks in the state
     state.historical_block_hashes.append(block.parent)
-    state.justified_slots.append(False)
     while len(state.historical_block_hashes) < block.slot:
-        state.justified_slots.append(False)
         state.historical_block_hashes.append(None)
     # Process votes
     for vote in block.votes:
-        # Ignore votes without a source or target, or with source later than
-        # the latest finalized slot or not already justified, or whose target
-        # or source is not in the history, or whose target is not a
-        # valid justifiable slot
+
         if (
-            vote.source is None or vote.target is None
-            or vote.source.checkpoint_slot < state.latest_finalized.checkpoint_slot
-            or state.justified_slots[vote.source.checkpoint_slot] is False
-            or vote.source.hash != state.historical_block_hashes[vote.source.chain_slot]
-            or vote.target.hash != state.historical_block_hashes[vote.target.chain_slot]
-            or vote.target.checkpoint_slot <= vote.source.checkpoint_slot
-            or not is_justifiable_slot(state.config, state.latest_finalized.checkpoint_slot, vote.target.checkpoint_slot)
+            not is_voting_slot(vote.finalized_slot, vote.target.slot)
+            or vote.source.slot < state.latest_finalized.slot
+            or vote.source not in state.justified_checkpoints
+            or vote.target.slot <= vote.source.slot
+        ):
+            continue
+
+        if vote.target.hash != ZERO_HASH and (
+            not is_justifiable_slot(vote.finalized_slot, vote.target.slot)
+            or vote.target.hash != state.historical_block_hashes[vote.target_block_slot]
         ):
             continue
 
         # Track attempts to justify new hashes
-        if vote.target.hash not in state.justifications:
-            state.justifications[vote.target.hash] = [False] * state.config.num_validators
+        justification_key = compute_hash((vote.finalized_slot, vote.source, vote.target))
+        if justification_key not in state.justifications:
+            state.justifications[justification_key] = [False] * state.config.num_validators
 
-        if not state.justifications[vote.target.hash][vote.validator_id]:
-            state.justifications[vote.target.hash][vote.validator_id] = True
+        if not state.justifications[justification_key][vote.validator_id]:
+            state.justifications[justification_key][vote.validator_id] = True
 
-        count = sum(state.justifications[vote.target.hash])
+        count = sum(state.justifications[justification_key])
 
         # If 2/3 voted for the same new valid hash to justify
         if count == (2 * state.config.num_validators) // 3:
-            state.latest_justified = vote.target
-            state.justified_slots[vote.target.checkpoint_slot] = True
-            del state.justifications[vote.target.hash]
+            if vote.target.hash != ZERO_HASH:
+                state.latest_justified = vote.target
+                state.justified_checkpoints.append(vote.target)
+            del state.justifications[justification_key]
 
             # Finalization: if the target is the next valid justifiable
-            # hash after the source
+            # slot after the source, wrt the finalized slot in the votes
             if not any(
-                is_justifiable_slot(state.config, state.latest_finalized.checkpoint_slot, slot)
-                for slot in range(vote.source.checkpoint_slot + 1, vote.target.checkpoint_slot)
+                is_justifiable_slot(vote.finalized_slot, slot)
+                for slot in range(vote.source.slot + 1, vote.target.slot)
             ):
                 state.latest_finalized = vote.source
+                # Prune old checkpoints
+                state.justified_checkpoints = [
+                    checkpoint for checkpoint in state.justified_checkpoints 
+                    if checkpoint.slot >= state.latest_finalized.slot
+                ]
 
     return state
 
@@ -115,7 +137,7 @@ def process_block(state: State, block: Block) -> State:
 def get_latest_justified_checkpoint(post_states: Dict[str, State]) -> Checkpoint:
     latest = max(   
         post_states.values(),
-        key=lambda s: s.latest_justified.checkpoint_slot
+        key=lambda s: s.latest_justified.slot
     )
     return latest.latest_justified
 
@@ -131,7 +153,7 @@ def get_fork_choice_head(blocks: Dict[str, Block],
 
     # Identify latest votes
     latest_votes = {}
-    for vote in sorted(votes, key=lambda vote: vote.slot):
+    for vote in sorted(votes, key=lambda vote: vote.target.slot):
         latest_votes[vote.validator_id] = vote
 
     # For each block, count the number of votes for that block. A vote

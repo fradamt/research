@@ -143,12 +143,13 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
 
     # Draw votes
     latest_votes = {}
-    for vote in sorted(staker.known_votes, key = lambda vote: vote.slot):
+    for vote in sorted(staker.known_votes, key = lambda v: v.target.slot):
         latest_votes[vote.validator_id] = vote
 
     for vote in latest_votes.values():
-        if vote.head[:8] not in pos or (vote.target is not None and vote.target.hash[:8] not in pos):
+        if vote.head[:8] not in pos:
             continue
+        
         voter_node = f"v{vote.validator_id}"
         offset = (vote.validator_id - max_validator_id / 2) * 0.15
         pos[voter_node] = (pos[vote.head[:8]][0] + offset, pos[vote.head[:8]][1] - 0.5)
@@ -160,9 +161,10 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
         nx.draw_networkx_nodes(G, pos, nodelist=[voter_node], node_color=color, node_size=200)
         nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.head[:8])], edge_color=color,
                                style="dashed", arrowsize=8)
-        # Only add target edge if target exists
-        if vote.target is not None:
-            G.add_edge(voter_node, vote.target.hash[:8])
+        
+        # Only add FFG target edge if target.hash is not ZERO_HASH and its position is known
+        if vote.target.hash != ZERO_HASH and vote.target.hash[:8] in pos:
+            G.add_edge(voter_node, vote.target.hash[:8]) # Add FFG target edge
             nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.target.hash[:8])], edge_color="grey",
                                    style="dashed", arrowsize=8)
             
@@ -170,7 +172,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
 
     # Add time and finality distance info
     current_slot = staker.get_current_slot()
-    finalized_slot = staker.post_states[staker.head].latest_finalized.checkpoint_slot
+    finalized_slot = staker.post_states[staker.head].latest_finalized.slot
     distance_from_finality = current_slot - finalized_slot
     
     info_text = f"Time: {staker.network.time}\nDistance from finality: {distance_from_finality} slots"
@@ -184,25 +186,24 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     fig.canvas.draw()
     fig.canvas.flush_events()
 
-def plot_progression(justified_slots, finalized_slots):
+def plot_progression(justified_slots, finalized_slots, justified_block_slots, finalized_block_slots):
     plt.figure(figsize=(12, 6))
     
-    plt.plot(range(len(justified_slots)), label='Slot', color='green', linestyle='--')
-    plt.plot(justified_slots, label='Max Justified Slot', color='blue')
-    plt.plot(finalized_slots, label='Max Finalized Slot', color='purple')
+    time_axis = list(range(2, len(justified_slots) + 2))
+    plt.plot(time_axis, justified_slots, label='Max Justified Checkpoint Slot', color='blue')
+    plt.plot(time_axis, finalized_slots, label='Max Finalized Checkpoint Slot', color='purple')
+    plt.plot(time_axis, justified_block_slots, label='Max Justified Block Slot', color='cyan', linestyle='--')
+    plt.plot(time_axis, finalized_block_slots, label='Max Finalized Block Slot', color='magenta', linestyle='--')
     
     plt.xlabel('Time (simulation slots elapsed)')
     plt.ylabel('Slot Number')
-    plt.title('Progression of Justified, Finalized')
+    plt.title('Progression of Checkpoint vs Block Slots')
     plt.legend()
     plt.grid(True)
-    # No plt.show() here, it's called once at the end of the script
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run a P2P network simulation')
-    parser.add_argument('--no-backoff', action='store_true', help='Disable k-th ancestor backoff')
     parser.add_argument('--no-pruning', action='store_true', help='Prune conflicting branches when finalized')
-    parser.add_argument('--max-backoff', type=int, default=8, help='Maximum checkpoint interval for backoff')
     parser.add_argument('--latency', type=int, help='latency to use')
     parser.add_argument('--time', type=int, default=1000, help='Number of time steps to run')
     parser.add_argument('--no-viz', action='store_true', help='Disable interactive graph visualization')
@@ -220,13 +221,13 @@ if __name__ == '__main__':
 
     # Create genesis block and state
     genesis_block = Block(slot=1, parent=ZERO_HASH)
-    config = Config(num_validators=NUM_STAKERS, max_checkpoint_interval_for_backoff=args.max_backoff)
+    config = Config(num_validators=NUM_STAKERS)
     genesis_state = State(
         config=config,
-        latest_justified=Checkpoint(hash=ZERO_HASH, chain_slot=0, checkpoint_slot=0),
-        latest_finalized=Checkpoint(hash=ZERO_HASH, chain_slot=0, checkpoint_slot=0),
+        latest_justified=Checkpoint(hash=ZERO_HASH, slot=0),
+        latest_finalized=Checkpoint(hash=ZERO_HASH, slot=0),
         historical_block_hashes=[ZERO_HASH],
-        justified_slots=[True],
+        justified_checkpoints=[Checkpoint(hash=ZERO_HASH, slot=0)],
     )
     genesis_block.state_root = compute_hash(genesis_state)
     genesis_hash = compute_hash(genesis_block)
@@ -242,7 +243,7 @@ if __name__ == '__main__':
 
 
     network = P2PNetwork(latency_func)
-    stakers = [Staker(i, network, genesis_block, genesis_state, use_backoff=not args.no_backoff) for i in range(NUM_STAKERS)]
+    stakers = [Staker(i, network, genesis_block, genesis_state) for i in range(NUM_STAKERS)]
 
     # Initialize all stakers with genesis
     for staker in stakers:
@@ -251,7 +252,8 @@ if __name__ == '__main__':
     # Initialize data collection for progression plot
     justified_slots = []
     finalized_slots = []
-    actual_slots_data = [] # New list for actual slots
+    justified_block_slots = []
+    finalized_block_slots = []
 
     # Simulation loop
     for time in range(args.time):
@@ -264,27 +266,46 @@ if __name__ == '__main__':
 
         # Collect data for progression plot
         if time % SLOT_DURATION == 0:
-            current_slot = time // SLOT_DURATION
-            max_justified = max(staker.latest_justified.checkpoint_slot for staker in stakers)
-            max_finalized = max(staker.latest_finalized.checkpoint_slot for staker in stakers)
+            slot = time // SLOT_DURATION + 2
+            print(f"\n=== Time {time}, Slot {slot} ===")
+            max_justified = max(s.latest_justified.slot for s in stakers)
+            max_finalized = max(s.latest_finalized.slot for s in stakers)
             justified_slots.append(max_justified)
             finalized_slots.append(max_finalized)
-            actual_slots_data.append(current_slot) # Store current slot
 
-        # Periodic printout
-        if time % SLOT_DURATION == 0:
-            print(f"\n=== Time {time}, Slot {time // SLOT_DURATION} === ")
+            # Track corresponding block slots
+            max_justified_block = max(
+                staker.chain[staker.latest_justified.hash].slot if staker.latest_justified.hash in staker.chain else 0
+                for staker in stakers
+            )
+            max_finalized_block = max(
+                staker.chain[staker.latest_finalized.hash].slot if staker.latest_finalized.hash in staker.chain else 0
+                for staker in stakers
+            )
+            justified_block_slots.append(max_justified_block)
+            finalized_block_slots.append(max_finalized_block)
+
             for staker in stakers:
                 head = staker.head
-                ljs = staker.latest_justified.checkpoint_slot
+                # Access .slot for FFG checkpoint slots
+                ljs = staker.latest_justified.slot
                 ljh = staker.latest_justified.hash
-                lfs = staker.latest_finalized.checkpoint_slot
+                lfs = staker.latest_finalized.slot
                 lfh = staker.latest_finalized.hash
-                target_block = staker.get_target_block()
-                tbh = compute_hash(target_block)
-                tbs = target_block.slot
-                is_justifiable = is_justifiable_slot(config, staker.post_states[staker.head].latest_finalized.checkpoint_slot, time // SLOT_DURATION)
-                print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) {'✓' if is_justifiable else '✗'} | Justified={ljh[:8]} ({ljs}) | Finalized={lfh[:8]} ({lfs})")
+                
+                is_justifiable_now = is_justifiable_slot(staker.latest_finalized.slot, slot)
+                
+                ffg_target_display_str: str
+                if is_justifiable_now:
+                    target_block = staker.get_target_block() # The block whose hash is used for FFG target
+                    ffg_target_hash_display = compute_hash(target_block)
+                    # FFG target slot is staker_current_block_slot. The block itself is actual_target_block.
+                    ffg_target_display_str = f"{ffg_target_hash_display[:8]} (block slot {target_block.slot}, FFG target slot {slot})"
+                else:
+                    # FFG target is ZERO_HASH, FFG target slot is staker_current_block_slot
+                    ffg_target_display_str = f"{ZERO_HASH[:8]} (FFG target slot {slot})"
+
+                print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | FFG Target={ffg_target_display_str} {'✓' if is_justifiable_now else '✗'} | Justified={ljh[:8]} ({ljs}) | Finalized={lfh[:8]} ({lfs})")
         if not args.no_viz and time % 60 == 9:
             plot_view(fig, ax, stakers[0], "Chain View", prune=not args.no_pruning) # Pass prune correctly
 
@@ -292,5 +313,5 @@ if __name__ == '__main__':
         plt.ioff() # Turn off interactive mode before the final blocking show
 
     # Plot the progression at the end
-    plot_progression(justified_slots, finalized_slots)
+    plot_progression(justified_slots, finalized_slots, justified_block_slots, finalized_block_slots)
     plt.show()  # Show all figures and block until closed
