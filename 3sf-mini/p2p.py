@@ -165,7 +165,6 @@ class Staker:
 
     # Called when it's the staker's turn to vote
     def vote(self):
-        state = self.post_states[self.head]
         slot = self.get_current_slot()
 
         if not is_voting_slot(self.latest_finalized.slot, slot):

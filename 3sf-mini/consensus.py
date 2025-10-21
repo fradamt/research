@@ -6,7 +6,8 @@ import json
 import copy
 
 ZERO_HASH = '0'*64
-MAX_BACKOFF_INTERVAL = 8
+MAX_BACKOFF_INTERVAL_JUSTIFICATION = 8
+MAX_BACKOFF_INTERVAL_VOTING = 1
 
 # Chain configuration
 @dataclass
@@ -62,7 +63,10 @@ def compute_hash(obj: object):
 def compute_backoff_interval(finalized_slot: int, slot: int, backoff_type: BackoffType):
     assert slot >= finalized_slot
     delta = slot - finalized_slot
-    max_backoff_interval = MAX_BACKOFF_INTERVAL // (2 if backoff_type == BackoffType.VOTING else 1)
+    if backoff_type == BackoffType.VOTING:
+        max_backoff_interval = MAX_BACKOFF_INTERVAL_VOTING
+    else:
+        max_backoff_interval = MAX_BACKOFF_INTERVAL_JUSTIFICATION
     return min(2**(delta // 4), max_backoff_interval)
 
 # Determines if a candidate slot is justifiable based on an exponential backoff mechanism (with a cap).
