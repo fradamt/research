@@ -5,13 +5,13 @@ import copy
 from consensus import (
     State, SlowVote, FastVote, Block, Checkpoint, majority_fork_choice,
     process_block, get_latest_justified_checkpoint, get_fork_choice_head,
-    majority_fork_choice, compute_hash
+    compute_hash, is_slow_voting_slot
 )
 from collections import defaultdict
 
 SLOT_DURATION = 12  # time units
 ZERO_HASH = '0'*64
-KAPPA = 8
+KAPPA = 32
 
 # A basic Staker node implementation
 class Staker:
@@ -136,20 +136,14 @@ class Staker:
 
         # Called when it's the staker's turn to vote
     def slow_vote(self):
-        slot = self.get_current_slot()
-        target_block = self.get_target_block()
-        target = Checkpoint(
-            hash=compute_hash(target_block),
-            chain_slot=target_block.slot,
-            checkpoint_slot=slot
-        )
-
+        if not is_slow_voting_slot(self.latest_finalized.checkpoint_slot, self.get_current_slot()):
+            return
+        
         vote =  SlowVote(
             validator_id=self.validator_id,
-            slot=slot,
-            head=self.confirmed_hash,
+            finalized_slot=self.latest_finalized.checkpoint_slot,
             source=self.latest_justified,
-            target=target
+            target=self.get_target()
         )
         
         self.receive(vote)
@@ -168,22 +162,35 @@ class Staker:
         if fast_confirmed_block.slot >= self.get_current_slot() - KAPPA:
             self.confirmed_hash = fast_confirmed_hash
         else:
-            current_block = self.chain[self.head]
-            while current_block.slot > self.get_current_slot() - KAPPA:
-                current_block = self.chain[current_block.parent]
-            self.confirmed_hash = compute_hash(current_block)
+            kappa_deep_slot = self.get_current_slot() - KAPPA
+            self.confirmed_hash = compute_hash(self.get_block_at_slot(kappa_deep_slot))
 
-    def get_target_block(self):
+    def get_block_at_slot(self, slot: int):
+        if slot <= self.chain[self.genesis_hash].slot:
+            return self.chain[self.genesis_hash]
+        current_block = self.chain[self.head]
+        while current_block.slot > slot:
+            current_block = self.chain[current_block.parent]
+        return current_block
+
+    def get_target(self):
         if self.latest_justified.checkpoint_slot + 1 == self.get_current_slot():
-            target_hash = self.confirmed_hash
+            target_block = self.chain[self.confirmed_hash]
         else:
-            target_hash = majority_fork_choice(
+            majority_hash = majority_fork_choice(
                 self.chain,
                 self.latest_justified.hash,
-                self.latest_slow_votes.values(),
-                min_score=self.num_validators * 2 // 3
+                self.latest_slow_votes.values()
             )
-        return self.chain[target_hash]
+            majority_block = self.chain[majority_hash]
+            kappa_deep_slot = self.get_current_slot() - KAPPA
+            target_block = self.get_block_at_slot(max(majority_block.slot, kappa_deep_slot))
+
+        return Checkpoint(
+            hash=compute_hash(target_block),
+            chain_slot=target_block.slot,
+            checkpoint_slot=self.get_current_slot()
+        )
     
     # Called by the p2p network
     def receive(self, item: Union[Block, FastVote, SlowVote]):
@@ -217,15 +224,15 @@ class Staker:
                 # process later once we actually see the parent
                 self.dependencies.setdefault(item.parent, []).append(item)
         elif isinstance(item, SlowVote):
-            if item.head in self.chain:
+            if item.target.hash in self.chain:
                 self.slow_votes.add(item)
                 if (
                     item.validator_id not in self.latest_slow_votes
-                    or item.slot > self.latest_slow_votes[item.validator_id].slot
+                    or item.target.checkpoint_slot > self.latest_slow_votes[item.validator_id].target.checkpoint_slot
                 ):
                     self.latest_slow_votes[item.validator_id] = item
             else:
-                self.dependencies.setdefault(item.head, []).append(item)
+                self.dependencies.setdefault(item.target.hash, []).append(item)
         elif isinstance(item, FastVote):
             if item.slot == self.current_fast_vote_slot:
                 if item.head in self.chain:
@@ -245,7 +252,7 @@ class P2PNetwork:
         self.stakers[staker.validator_id] = staker
 
     def submit(self, item: Union[Block, FastVote, SlowVote], sender_id: int):
-        for recipient_id, staker in self.stakers.items():
+        for recipient_id, _ in self.stakers.items():
             if recipient_id == sender_id:
                 continue
             deliver_at = self.time + self.latency_func(self.time)

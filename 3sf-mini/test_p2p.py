@@ -1,7 +1,7 @@
 from consensus import (
     State, SlowVote, FastVote, Block, Config, Checkpoint,
     get_latest_justified_checkpoint, get_fork_choice_head,
-    compute_hash
+    compute_hash, is_slow_voting_slot
 )
 from p2p import Staker, P2PNetwork
 from typing import Optional, List, Dict
@@ -109,7 +109,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     # Color blocks
     justified_hash = get_latest_justified_checkpoint(staker.post_states).hash
     finalized_hash = staker.latest_finalized.hash
-    head_block = get_fork_choice_head(staker.chain, justified_hash, staker.slow_votes, staker.fast_votes)
+    head_block = get_fork_choice_head(staker.chain, justified_hash, staker.fast_votes, staker.latest_slow_votes.values())
 
     node_colors = []
     node_sizes = []
@@ -141,18 +141,18 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     nx.draw_networkx_labels(G, pos, font_size=8)
 
     for vote in staker.latest_slow_votes.values():
-        if vote.head[:8] not in pos or (vote.target.hash[:8] not in pos):
+        if vote.target.hash[:8] not in pos:
             continue
         voter_node = f"v{vote.validator_id}"
         offset = (vote.validator_id - max_validator_id / 2) * 0.15
-        pos[voter_node] = (pos[vote.head[:8]][0] + offset, pos[vote.head[:8]][1] - 0.5)
+        pos[voter_node] = (pos[vote.target.hash[:8]][0] + offset, pos[vote.target.hash[:8]][1] - 0.5)
 
         G.add_node(voter_node, node_size=5)
-        G.add_edge(voter_node, vote.head[:8])
+        G.add_edge(voter_node, vote.target.hash[:8])
 
         color = "orange"
         nx.draw_networkx_nodes(G, pos, nodelist=[voter_node], node_color=color, node_size=200)
-        nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.head[:8])], edge_color=color,
+        nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.target.hash[:8])], edge_color=color,
                                style="dashed", arrowsize=8)
         # Only add target edge if target exists
         G.add_edge(voter_node, vote.target.hash[:8])
@@ -220,15 +220,15 @@ if __name__ == '__main__':
         latest_justified=Checkpoint(hash=ZERO_HASH, chain_slot=0, checkpoint_slot=0),
         latest_finalized=Checkpoint(hash=ZERO_HASH, chain_slot=0, checkpoint_slot=0),
         historical_block_hashes=[ZERO_HASH],
-        justified_slots=[True],
+        justified_checkpoints=[Checkpoint(hash=ZERO_HASH, chain_slot=0, checkpoint_slot=0)],
     )
     genesis_block.state_root = compute_hash(genesis_state)
     genesis_hash = compute_hash(genesis_block)
 
     def latency_func(t):
-            if t < args.time // 3:
+            if t < args.time // 4:
                 return 1
-            elif t < 2 * args.time // 3:
+            elif t < 3 * args.time // 4:
                 if args.latency is not None:
                     return args.latency * SLOT_DURATION // 4
                 else:
@@ -278,10 +278,14 @@ if __name__ == '__main__':
                 ljh = staker.latest_justified.hash
                 lfs = staker.latest_finalized.checkpoint_slot
                 lfh = staker.latest_finalized.hash
-                target_block = staker.get_target_block()
-                tbh = compute_hash(target_block)
-                tbs = target_block.slot
-                print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} ({ljs}) | Finalized={lfh[:8]} ({lfs})")
+                target = staker.get_target()
+                tbh = target.hash
+                tbs = target.chain_slot
+                slow_voting_slot = is_slow_voting_slot(lfs, time // SLOT_DURATION + 2)
+                if slow_voting_slot:
+                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} ({ljs}) | Finalized={lfh[:8]} ({lfs}) | Slow voting slot")
+                else:
+                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} ({ljs}) | Finalized={lfh[:8]} ({lfs}) | Not slow voting slot")
         if not args.no_viz and time % 60 == 9:
             plot_view(fig, ax, stakers[0], "Chain View", prune=not args.no_pruning) # Pass prune correctly
 

@@ -5,8 +5,7 @@ import json
 import copy
 
 ZERO_HASH = '0'*64
-MAX_BACKOFF_INTERVAL_JUSTIFICATION = 8
-MAX_BACKOFF_INTERVAL_VOTING = 1
+MAX_BACKOFF_INTERVAL_EXPONENT = 4
 
 # Chain configuration
 @dataclass
@@ -25,7 +24,7 @@ class State:
     latest_justified: Checkpoint
     latest_finalized: Checkpoint
     historical_block_hashes: List[str] = field(default_factory=list)
-    justified_slots: List[bool] = field(default_factory=list)
+    justified_checkpoints: List[Checkpoint] = field(default_factory=list)
     justifications: Dict[str, List[bool]] = field(default_factory=dict)
 
 @dataclass(frozen=True)
@@ -37,10 +36,15 @@ class FastVote:
 @dataclass(frozen=True)
 class SlowVote:
     validator_id: int
-    slot: int
-    head: str
+    finalized_slot: int
     source: Checkpoint
     target: Checkpoint
+
+
+@dataclass
+class GHOSTVote:
+    validator_id: int
+    head: str
 
 # A block
 @dataclass
@@ -51,33 +55,24 @@ class Block:
     slow_votes: List[SlowVote] = field(default_factory=list)
     state_root: Optional[str] = None
 
-class BackoffType(Enum):
-    JUSTIFICATION = "justification"
-    VOTING = "voting"
-
-
 # Stub for computing block hash, state root...
 # (in real life replace with SSZ hashing)
 def compute_hash(obj: object):
-    serialized = json.dumps(asdict(obj), sort_keys=True).encode()
+    if isinstance(obj, tuple):
+        serialized = json.dumps([asdict(item) if hasattr(item, '__dataclass_fields__') else item for item in obj], sort_keys=True).encode()
+    else:
+        serialized = json.dumps(asdict(obj), sort_keys=True).encode()
     return hashlib.sha256(serialized).hexdigest()
 
-
-def compute_backoff_interval(finalized_slot: int, slot: int, backoff_type: BackoffType):
-    assert slot >= finalized_slot
-    delta = slot - finalized_slot
-    if backoff_type == BackoffType.VOTING:
-        max_backoff_interval = MAX_BACKOFF_INTERVAL_VOTING
-    else:
-        max_backoff_interval = MAX_BACKOFF_INTERVAL_JUSTIFICATION
-    return min(2**(delta // 4), max_backoff_interval)
-
-
-# Determines if a candidate slot is justifiable based on an exponential backoff mechanism (with a cap).
-# A checkpoint_interval is calculated based on the distance from the last finalized slot, and a slot
-#  is justifiable only if it is a multiple. The mechanism helps finality progress under high latency.
-def is_justifiable_slot(finalized_slot: int, target_slot: int):
-    backoff_interval = compute_backoff_interval(finalized_slot, target_slot, BackoffType.JUSTIFICATION)
+# Determines if slow voting should take place in a given slot, based on an exponential backoff mechanism (with a cap).
+# A backoff interval is calculated based on the distance from the last finalized slot, and slow voting should
+# only take place if the slot is a multiple of the interval. Slow votes carry a `finalized_slot`, and are invalid
+# if they violate this rule. The mechanism helps finality progress under high latency.
+def is_slow_voting_slot(finalized_slot: int, target_slot: int):
+    max_backoff_interval = 2**MAX_BACKOFF_INTERVAL_EXPONENT
+    delta = (target_slot - finalized_slot) * (MAX_BACKOFF_INTERVAL_EXPONENT - 1)
+    delta = delta // (2 * max_backoff_interval)
+    backoff_interval = min(2**delta, max_backoff_interval)
     return target_slot % backoff_interval == 0
 
 # Given a state, output the new state after processing that block
@@ -85,29 +80,24 @@ def process_block(state: State, block: Block) -> State:
     state = copy.deepcopy(state)
     # Track historical blocks in the state
     state.historical_block_hashes.append(block.parent)
-    state.justified_slots.append(False)
     while len(state.historical_block_hashes) < block.slot:
-        state.justified_slots.append(False)
         state.historical_block_hashes.append(None)
     # Process votes
     for vote in block.slow_votes:
-        if (
-            vote.source.checkpoint_slot < state.latest_finalized.checkpoint_slot
-            or state.justified_slots[vote.source.checkpoint_slot] is False
-            or vote.source.hash != state.historical_block_hashes[vote.source.chain_slot]
-            or vote.target.checkpoint_slot <= vote.source.checkpoint_slot
-            or state.justified_slots[vote.target.checkpoint_slot] is True
-        ):
-            continue
 
         if (
-            not is_justifiable_slot(vote.finalized_slot, vote.target.checkpoint_slot)
+            not is_slow_voting_slot(vote.finalized_slot, vote.target.checkpoint_slot)
+            or vote.source.checkpoint_slot < state.latest_finalized.checkpoint_slot
+            or vote.source not in state.justified_checkpoints
+            or vote.target in state.justified_checkpoints
             or vote.target.hash != state.historical_block_hashes[vote.target.chain_slot]
+            # or vote.target.chain_slot < vote.source.chain_slot
+            or vote.target.checkpoint_slot <= vote.source.checkpoint_slot
         ):
             continue
 
         # Track attempts to justify new hashes
-        justification_key = vote.source.hash + vote.target.hash
+        justification_key = compute_hash((vote.finalized_slot, vote.source, vote.target))
         if justification_key not in state.justifications:
             state.justifications[justification_key] = [False] * state.config.num_validators
 
@@ -119,11 +109,22 @@ def process_block(state: State, block: Block) -> State:
         # If 2/3 voted for the same new valid hash to justify
         if count == (2 * state.config.num_validators) // 3:
             state.latest_justified = vote.target
-            state.justified_slots[vote.target.checkpoint_slot] = True
+            state.justified_checkpoints.append(vote.target)
             del state.justifications[justification_key]
 
-            if vote.source.checkpoint_slot + 1 == vote.target.checkpoint_slot:
+
+            # Finalization: if the target is the next valid slow voting
+            # slot after the source, wrt the finalized slot in the votes.
+            if not any(
+                is_slow_voting_slot(vote.finalized_slot, slot)
+                for slot in range(vote.source.checkpoint_slot + 1, vote.target.checkpoint_slot)
+            ):
                 state.latest_finalized = vote.source
+                # Prune old checkpoints
+                state.justified_checkpoints = [
+                    checkpoint for checkpoint in state.justified_checkpoints 
+                    if checkpoint.checkpoint_slot >= state.latest_finalized.checkpoint_slot
+                ]
 
     return state
 
@@ -141,16 +142,17 @@ def get_fork_choice_head(blocks: Dict[str, Block],
         latest_slow_votes: List[SlowVote],
         min_score: int = 0) -> str:
     majority_fc_output = majority_fork_choice(blocks, root, latest_slow_votes)
-    return ghost_fork_choice(blocks, majority_fc_output, fast_votes, require_relative_majority=False, min_score=min_score)
+    ghost_votes = [GHOSTVote(validator_id=vote.validator_id, head=vote.head) for vote in fast_votes]
+    return ghost_fork_choice(blocks, majority_fc_output, ghost_votes, require_relative_majority=False, min_score=min_score)
 
 def majority_fork_choice(blocks: Dict[str, Block],
         root: str,
-        latest_slow_votes: List[SlowVote],
-        min_score: int = 0) -> str:
+        latest_slow_votes: List[SlowVote]) -> str:
     # Start at genesis by default
     if root == ZERO_HASH:
         root = min(blocks.keys(), key=lambda block: blocks[block].slot)
-    return ghost_fork_choice(blocks, root, latest_slow_votes, require_relative_majority=True, min_score=min_score)
+    ghost_votes = [GHOSTVote(validator_id=vote.validator_id, head=vote.target.hash) for vote in latest_slow_votes]
+    return ghost_fork_choice(blocks, root, ghost_votes, require_relative_majority=True)
 
 
 def ghost_fork_choice(blocks: Dict[str, Block],
