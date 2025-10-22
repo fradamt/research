@@ -1,10 +1,9 @@
 from consensus import (
-    State, Vote, Block, Config, Checkpoint,
+    State, SlowVote, FastVote, Block, Config, Checkpoint,
     get_latest_justified_checkpoint, get_fork_choice_head,
     compute_hash
 )
 from p2p import Staker, P2PNetwork
-from consensus import is_justifiable_slot
 from typing import Optional, List, Dict
 import random
 import argparse
@@ -72,7 +71,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     x_counter = [0]
     max_validator_id = max(
         [staker.validator_id] +
-        [vote.validator_id for vote in staker.known_votes]
+        [vote.validator_id for vote in staker.slow_votes]
     )
 
     def dfs(block_hash, depth=0, is_finalized=False):
@@ -110,7 +109,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     # Color blocks
     justified_hash = get_latest_justified_checkpoint(staker.post_states).hash
     finalized_hash = staker.latest_finalized.hash
-    head_block = get_fork_choice_head(staker.chain, justified_hash, staker.known_votes)
+    head_block = get_fork_choice_head(staker.chain, justified_hash, staker.slow_votes, staker.fast_votes)
 
     node_colors = []
     node_sizes = []
@@ -141,13 +140,8 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     nx.draw_networkx_edges(G, pos, arrowstyle="->", arrowsize=10)
     nx.draw_networkx_labels(G, pos, font_size=8)
 
-    # Draw votes
-    latest_votes = {}
-    for vote in sorted(staker.known_votes, key = lambda vote: vote.slot):
-        latest_votes[vote.validator_id] = vote
-
-    for vote in latest_votes.values():
-        if vote.head[:8] not in pos or (vote.target is not None and vote.target.hash[:8] not in pos):
+    for vote in staker.latest_slow_votes.values():
+        if vote.head[:8] not in pos or (vote.target.hash[:8] not in pos):
             continue
         voter_node = f"v{vote.validator_id}"
         offset = (vote.validator_id - max_validator_id / 2) * 0.15
@@ -161,10 +155,9 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
         nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.head[:8])], edge_color=color,
                                style="dashed", arrowsize=8)
         # Only add target edge if target exists
-        if vote.target is not None:
-            G.add_edge(voter_node, vote.target.hash[:8])
-            nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.target.hash[:8])], edge_color="grey",
-                                   style="dashed", arrowsize=8)
+        G.add_edge(voter_node, vote.target.hash[:8])
+        nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.target.hash[:8])], edge_color="grey",
+                                style="dashed", arrowsize=8)
             
         nx.draw_networkx_labels(G, pos, labels={voter_node: f"v{vote.validator_id}"}, font_size=6)
 
@@ -184,16 +177,17 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     fig.canvas.draw()
     fig.canvas.flush_events()
 
-def plot_progression(justified_slots, finalized_slots):
+def plot_progression(confirmed_slots, justified_slots, finalized_slots):
     plt.figure(figsize=(12, 6))
     
-    plt.plot(range(len(justified_slots)), label='Slot', color='green', linestyle='--')
+    plt.plot(range(2, len(justified_slots) + 2), label='Slot', color='green', linestyle='--')
+    plt.plot(confirmed_slots, label='Max Confirmed Slot', color='red')
     plt.plot(justified_slots, label='Max Justified Slot', color='blue')
     plt.plot(finalized_slots, label='Max Finalized Slot', color='purple')
     
     plt.xlabel('Time (simulation slots elapsed)')
     plt.ylabel('Slot Number')
-    plt.title('Progression of Justified, Finalized')
+    plt.title('Progression of Confirmed, Justified, and Finalized Slots')
     plt.legend()
     plt.grid(True)
     # No plt.show() here, it's called once at the end of the script
@@ -220,7 +214,7 @@ if __name__ == '__main__':
 
     # Create genesis block and state
     genesis_block = Block(slot=1, parent=ZERO_HASH)
-    config = Config(num_validators=NUM_STAKERS, max_checkpoint_interval_for_backoff=args.max_backoff)
+    config = Config(num_validators=NUM_STAKERS)
     genesis_state = State(
         config=config,
         latest_justified=Checkpoint(hash=ZERO_HASH, chain_slot=0, checkpoint_slot=0),
@@ -232,9 +226,11 @@ if __name__ == '__main__':
     genesis_hash = compute_hash(genesis_block)
 
     def latency_func(t):
-            if t < 2 * args.time // 3:
+            if t < args.time // 3:
+                return 1
+            elif t < 2 * args.time // 3:
                 if args.latency is not None:
-                    return args.latency * SLOT_DURATION
+                    return args.latency * SLOT_DURATION // 4
                 else:
                     return int(SLOT_DURATION * 2.5 * random.random() ** 3)
             else:
@@ -249,31 +245,33 @@ if __name__ == '__main__':
         assert staker.head == genesis_hash
 
     # Initialize data collection for progression plot
+    confirmed_slots = []
     justified_slots = []
     finalized_slots = []
     actual_slots_data = [] # New list for actual slots
 
     # Simulation loop
     for time in range(args.time):
-        # Deliver messages
-        network.time_step()
 
         # Run staker code
         for staker in stakers:
             staker.tick()
 
-        # Collect data for progression plot
-        if time % SLOT_DURATION == 0:
-            current_slot = time // SLOT_DURATION
-            max_justified = max(staker.latest_justified.checkpoint_slot for staker in stakers)
-            max_finalized = max(staker.latest_finalized.checkpoint_slot for staker in stakers)
+        # Deliver messages
+        network.time_step()
+
+        # Periodic printout and data collection
+        if time % SLOT_DURATION == 2 * SLOT_DURATION // 4:
+            current_slot = time // SLOT_DURATION + 2
+            max_confirmed = max(staker.chain[staker.confirmed_hash].slot for staker in stakers)
+            max_justified = max(staker.latest_justified.chain_slot for staker in stakers)
+            max_finalized = max(staker.latest_finalized.chain_slot for staker in stakers)
+            confirmed_slots.append(max_confirmed)
             justified_slots.append(max_justified)
             finalized_slots.append(max_finalized)
             actual_slots_data.append(current_slot) # Store current slot
 
-        # Periodic printout
-        if time % SLOT_DURATION == 0:
-            print(f"\n=== Time {time}, Slot {time // SLOT_DURATION} === ")
+            print(f"\n=== Time {time}, Slot {time // SLOT_DURATION + 2} === ")
             for staker in stakers:
                 head = staker.head
                 ljs = staker.latest_justified.checkpoint_slot
@@ -283,8 +281,7 @@ if __name__ == '__main__':
                 target_block = staker.get_target_block()
                 tbh = compute_hash(target_block)
                 tbs = target_block.slot
-                is_justifiable = is_justifiable_slot(config, staker.post_states[staker.head].latest_finalized.checkpoint_slot, time // SLOT_DURATION)
-                print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) {'✓' if is_justifiable else '✗'} | Justified={ljh[:8]} ({ljs}) | Finalized={lfh[:8]} ({lfs})")
+                print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} ({ljs}) | Finalized={lfh[:8]} ({lfs})")
         if not args.no_viz and time % 60 == 9:
             plot_view(fig, ax, stakers[0], "Chain View", prune=not args.no_pruning) # Pass prune correctly
 
@@ -292,5 +289,5 @@ if __name__ == '__main__':
         plt.ioff() # Turn off interactive mode before the final blocking show
 
     # Plot the progression at the end
-    plot_progression(justified_slots, finalized_slots)
+    plot_progression(confirmed_slots, justified_slots, finalized_slots)
     plt.show()  # Show all figures and block until closed
