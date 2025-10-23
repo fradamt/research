@@ -11,7 +11,7 @@ from collections import defaultdict
 
 SLOT_DURATION = 12  # time units
 ZERO_HASH = '0'*64
-KAPPA = 32
+KAPPA = 8
 
 # A basic Staker node implementation
 class Staker:
@@ -33,6 +33,8 @@ class Staker:
         self.fast_votes_buffer: Set[FastVote] = set()
         # Current valid slot for fast votes
         self.current_fast_vote_slot: int = 0
+        # Equivocators
+        self.equivocators: Set[int] = set()
         # Objects that we will process once we have processed their parents
         self.dependencies: Dict[str, List[Block]] = {}
         # Initialize the chain with the genesis block
@@ -207,11 +209,17 @@ class Staker:
                 # Receive fast votes if the block is timely and from the current slot
                 time_in_slot = (self.network.time % SLOT_DURATION)
                 timely_block = item.slot == self.get_current_slot() and time_in_slot <= SLOT_DURATION // 4
-                if timely_block and all(vote.slot == self.current_fast_vote_slot for vote in item.fast_votes):
-                    self.fast_votes.update(item.fast_votes)
+                if timely_block:
+                    for vote in item.fast_votes:
+                        if vote.validator_id not in self.equivocators:
+                            continue
+                        if vote.slot != self.current_fast_vote_slot:
+                            continue
+                        self.fast_votes.add(vote)
+                        self.handle_fast_vote_equivocations(vote)
                     self.recompute_head()
                 # Receive slow votes
-                for vote in item.slow_votes:
+                for vote in item.slow_votes:   
                     self.receive(vote)
                 # Once we have received a block, also process all of
                 # its dependencies
@@ -224,8 +232,11 @@ class Staker:
                 # process later once we actually see the parent
                 self.dependencies.setdefault(item.parent, []).append(item)
         elif isinstance(item, SlowVote):
+            if item.validator_id in self.equivocators:
+                return
             if item.target.hash in self.chain:
                 self.slow_votes.add(item)
+                self.handle_slow_vote_equivocations(item)
                 if (
                     item.validator_id not in self.latest_slow_votes
                     or item.target.checkpoint_slot > self.latest_slow_votes[item.validator_id].target.checkpoint_slot
@@ -234,11 +245,55 @@ class Staker:
             else:
                 self.dependencies.setdefault(item.target.hash, []).append(item)
         elif isinstance(item, FastVote):
-            if item.slot == self.current_fast_vote_slot:
-                if item.head in self.chain:
-                    self.fast_votes_buffer.add(item)
-                else:
-                    self.dependencies.setdefault(item.head, []).append(item)
+            if item.validator_id in self.equivocators:
+                return
+            if item.slot != self.current_fast_vote_slot:
+                return
+            if item.head in self.chain:
+                self.fast_votes_buffer.add(item)
+                self.handle_fast_vote_equivocations(item)
+            else:
+                self.dependencies.setdefault(item.head, []).append(item)
+
+    def handle_fast_vote_equivocations(self, vote: FastVote):
+        # Remove equivocations from fast votes
+        fast_vote_counts = {}
+        for vote in self.fast_votes_buffer.union(self.fast_votes):
+            fast_vote_counts[vote.validator_id] = fast_vote_counts.get(vote.validator_id, 0) + 1
+        
+        for validator_id, count in fast_vote_counts.items():
+            if count > 1:
+                self.equivocators.add(validator_id)
+
+        # Remove votes from equivocators
+        self.fast_votes_buffer = {
+            vote for vote in self.fast_votes_buffer
+            if vote.validator_id not in self.equivocators
+        }
+
+        self.fast_votes = {
+            vote for vote in self.fast_votes 
+            if validator_id not in self.equivocators
+        }
+
+    def handle_slow_vote_equivocations(self, vote: SlowVote):
+        # Remove equivocations from latest slow votes
+        slow_vote_counts = {}
+        for vote in self.latest_slow_votes.values():
+            slow_vote_counts[vote.validator_id] = slow_vote_counts.get(vote.validator_id, 0) + 1
+        
+        for validator_id, count in slow_vote_counts.items():
+            if count > 1:
+                self.equivocators.add(validator_id)
+        
+        # Update the latest slow votes dictionary
+        for validator_id in self.latest_slow_votes.keys():
+            if validator_id in self.equivocators:
+                del self.latest_slow_votes[validator_id]
+
+
+
+
 
 # Simulates a p2p network
 class P2PNetwork:

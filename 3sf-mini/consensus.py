@@ -5,7 +5,7 @@ import json
 import copy
 
 ZERO_HASH = '0'*64
-MAX_BACKOFF_INTERVAL_EXPONENT = 4
+MAX_BACKOFF_INTERVAL_EXPONENT = 3
 
 # Chain configuration
 @dataclass
@@ -39,7 +39,6 @@ class SlowVote:
     finalized_slot: int
     source: Checkpoint
     target: Checkpoint
-
 
 @dataclass
 class GHOSTVote:
@@ -157,7 +156,7 @@ def majority_fork_choice(blocks: Dict[str, Block],
 
 def ghost_fork_choice(blocks: Dict[str, Block],
         root: str,
-        votes: List[FastVote | SlowVote],
+        votes: List[GHOSTVote],
         require_relative_majority: bool,
         min_score: int = 0) -> str:
 
