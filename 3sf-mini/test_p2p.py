@@ -1,10 +1,9 @@
 from consensus import (
-    State, SlowVote, FastVote, Block, Config, Checkpoint,
+    State, Block, Config, Checkpoint,
     get_latest_justified_checkpoint, get_fork_choice_head,
-    compute_hash, is_slow_voting_slot
+    compute_hash, is_slow_voting_epoch, slot_to_epoch
 )
 from p2p import Staker, P2PNetwork
-from typing import Optional, List, Dict
 import random
 import argparse
 
@@ -71,7 +70,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     x_counter = [0]
     max_validator_id = max(
         [staker.validator_id] +
-        [vote.validator_id for vote in staker.slow_votes]
+        [vote.validator_id for vote in staker.slow_votes.values()]
     )
 
     def dfs(block_hash, depth=0, is_finalized=False):
@@ -109,7 +108,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     # Color blocks
     justified_hash = get_latest_justified_checkpoint(staker.post_states).hash
     finalized_hash = staker.latest_finalized.hash
-    head_block = get_fork_choice_head(staker.chain, justified_hash, staker.fast_votes, staker.latest_slow_votes.values())
+    head_block = get_fork_choice_head(staker.chain, staker.get_current_slot(), justified_hash, staker.fast_votes, staker.latest_slow_votes.values())
 
     node_colors = []
     node_sizes = []
@@ -163,7 +162,8 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
 
     # Add time and finality distance info
     current_slot = staker.get_current_slot()
-    finalized_slot = staker.post_states[staker.head].latest_finalized.checkpoint_slot
+    finalized_epoch = staker.post_states[staker.head].latest_finalized.epoch
+    finalized_slot = staker.post_states[staker.head].latest_finalized.slot
     distance_from_finality = current_slot - finalized_slot
     
     info_text = f"Time: {staker.network.time}\nDistance from finality: {distance_from_finality} slots"
@@ -200,6 +200,7 @@ if __name__ == '__main__':
     parser.add_argument('--latency', type=int, help='latency to use')
     parser.add_argument('--time', type=int, default=1000, help='Number of time steps to run')
     parser.add_argument('--no-viz', action='store_true', help='Disable interactive graph visualization')
+    parser.add_argument('--random-latency', action='store_true', help='Randomize latency function')
     args = parser.parse_args()
 
     SLOT_DURATION = 12
@@ -217,10 +218,10 @@ if __name__ == '__main__':
     config = Config(num_validators=NUM_STAKERS)
     genesis_state = State(
         config=config,
-        latest_justified=Checkpoint(hash=ZERO_HASH, chain_slot=0, checkpoint_slot=0),
-        latest_finalized=Checkpoint(hash=ZERO_HASH, chain_slot=0, checkpoint_slot=0),
+        latest_justified=Checkpoint(hash=ZERO_HASH, slot=0, epoch=0),
+        latest_finalized=Checkpoint(hash=ZERO_HASH, slot=0, epoch=0),
         historical_block_hashes=[ZERO_HASH],
-        justified_checkpoints=[Checkpoint(hash=ZERO_HASH, chain_slot=0, checkpoint_slot=0)],
+        justified_checkpoints=[Checkpoint(hash=ZERO_HASH, slot=0, epoch=0)],
     )
     genesis_block.state_root = compute_hash(genesis_state)
     genesis_hash = compute_hash(genesis_block)
@@ -230,12 +231,13 @@ if __name__ == '__main__':
                 return 1
             elif t < 3 * args.time // 4:
                 if args.latency is not None:
-                    return args.latency * SLOT_DURATION // 4
+                    random_factor = 2.5 * random.random() ** 3 if args.random_latency else 1
+                    return (args.latency * SLOT_DURATION // 4) * random_factor
                 else:
-                    return int(SLOT_DURATION * 2.5 * random.random() ** 3)
+                    return int(SLOT_DURATION * 2.5 * random.random() ** 3 * random_factor)
             else:
                 return 1
-
+    
 
     network = P2PNetwork(latency_func)
     stakers = [Staker(i, network, genesis_block, genesis_state, use_backoff=not args.no_backoff) for i in range(NUM_STAKERS)]
@@ -264,8 +266,8 @@ if __name__ == '__main__':
         if time % SLOT_DURATION == 2 * SLOT_DURATION // 4:
             current_slot = time // SLOT_DURATION + 2
             max_confirmed = max(staker.chain[staker.confirmed_hash].slot for staker in stakers)
-            max_justified = max(staker.latest_justified.chain_slot for staker in stakers)
-            max_finalized = max(staker.latest_finalized.chain_slot for staker in stakers)
+            max_justified = max(staker.latest_justified.slot for staker in stakers)
+            max_finalized = max(staker.latest_finalized.slot for staker in stakers)
             confirmed_slots.append(max_confirmed)
             justified_slots.append(max_justified)
             finalized_slots.append(max_finalized)
@@ -274,18 +276,19 @@ if __name__ == '__main__':
             print(f"\n=== Time {time}, Slot {time // SLOT_DURATION + 2} === ")
             for staker in stakers:
                 head = staker.head
-                ljs = staker.latest_justified.checkpoint_slot
+                lje = staker.latest_justified.epoch
                 ljh = staker.latest_justified.hash
-                lfs = staker.latest_finalized.checkpoint_slot
+                lfe = staker.latest_finalized.epoch
                 lfh = staker.latest_finalized.hash
                 target = staker.get_target()
                 tbh = target.hash
-                tbs = target.chain_slot
-                slow_voting_slot = is_slow_voting_slot(lfs, time // SLOT_DURATION + 2)
-                if slow_voting_slot:
-                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} ({ljs}) | Finalized={lfh[:8]} ({lfs}) | Slow voting slot")
+                tbs = target.slot
+                current_epoch = slot_to_epoch(time // SLOT_DURATION + 2)
+                slow_voting_epoch = is_slow_voting_epoch(lfe, current_epoch)
+                if slow_voting_epoch:
+                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} (Epoch: {lje}) | Finalized={lfh[:8]} (Epoch: {lfe}) | Slow voting slot")
                 else:
-                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} ({ljs}) | Finalized={lfh[:8]} ({lfs}) | Not slow voting slot")
+                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} (Epoch: {lje}) | Finalized={lfh[:8]} (Epoch: {lfe}) | Not slow voting slot")
         if not args.no_viz and time % 60 == 9:
             plot_view(fig, ax, stakers[0], "Chain View", prune=not args.no_pruning) # Pass prune correctly
 

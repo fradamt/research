@@ -5,13 +5,14 @@ import copy
 from consensus import (
     State, SlowVote, FastVote, Block, Checkpoint, majority_fork_choice,
     process_block, get_latest_justified_checkpoint, get_fork_choice_head,
-    compute_hash, is_slow_voting_slot
+    compute_hash, is_slow_voting_epoch, slot_to_epoch, SLOTS_PER_EPOCH
 )
 from collections import defaultdict
 
 SLOT_DURATION = 12  # time units
 ZERO_HASH = '0'*64
-KAPPA = 8
+KAPPA = 32
+
 
 # A basic Staker node implementation
 class Staker:
@@ -24,8 +25,9 @@ class Staker:
         self.chain: Dict[str, Block] = {}
         # {block hash: post state} for all blocks that we know about
         self.post_states: Dict[str, State] = {}
-        self.slow_votes: Set[SlowVote] = set()
-        # Latest unexpired slow votes of each validator
+        # Store all slow votes (keyed by validator_id, epoch)
+        self.slow_votes: Dict[Tuple[int, int], SlowVote] = {}
+        # Latest slow vote for each validator
         self.latest_slow_votes: Dict[int, SlowVote] = {}
         # Accepted fast votes
         self.fast_votes: Set[FastVote] = set()
@@ -59,12 +61,15 @@ class Staker:
     def latest_finalized(self):
         latest = max(   
             self.post_states.values(),
-            key=lambda s: s.latest_finalized.checkpoint_slot
+            key=lambda s: s.latest_finalized.epoch
         )
         return latest.latest_finalized
 
     def get_current_slot(self):
         return self.network.time // SLOT_DURATION + 2
+
+    def get_current_epoch(self):
+        return slot_to_epoch(self.get_current_slot())
 
     # Called every second
     def tick(self):
@@ -93,11 +98,15 @@ class Staker:
     def propose_block(self):
         new_slot = self.get_current_slot()
         head_state = self.post_states[self.head]
-        # naively just adds all votes
+        finalized_epoch = head_state.latest_finalized.epoch
+        slow_votes_to_include = [
+                vote for (_, epoch), vote in self.slow_votes.items()
+                if epoch > finalized_epoch
+            ]
         new_block = Block(
                 slot=new_slot,
                 parent=self.head,
-                slow_votes=list(self.slow_votes),
+                slow_votes=slow_votes_to_include,
                 fast_votes=list(self.fast_votes),
             )
         state = process_block(head_state, new_block)
@@ -108,11 +117,10 @@ class Staker:
         self.post_states[new_hash] = state
         self.network.submit(new_block, self.validator_id)
 
-
     # Done upon processing new votes or a new block
     def recompute_head(self):
         root = self.latest_justified.hash
-        self.head = get_fork_choice_head(self.chain, root, self.fast_votes, self.latest_slow_votes.values())
+        self.head = get_fork_choice_head(self.chain, self.get_current_slot(), root, self.fast_votes, self.latest_slow_votes.values())
 
     # Process new votes tha the staker has received. Vote processing is done
     # at a particular time, because of view-merge rules
@@ -136,14 +144,18 @@ class Staker:
         self.receive(vote)
         self.network.submit(vote, self.validator_id)
 
-        # Called when it's the staker's turn to vote
+    # Called when it's the staker's turn to vote
     def slow_vote(self):
-        if not is_slow_voting_slot(self.latest_finalized.checkpoint_slot, self.get_current_slot()):
+        # not the first slot in the epoch
+        if self.get_current_slot() % SLOTS_PER_EPOCH != 0:
+            return
+        # not a slow voting epoch
+        if not is_slow_voting_epoch(self.latest_finalized.epoch, self.get_current_epoch()):
             return
         
         vote =  SlowVote(
             validator_id=self.validator_id,
-            finalized_slot=self.latest_finalized.checkpoint_slot,
+            finalized_epoch=self.latest_finalized.epoch,
             source=self.latest_justified,
             target=self.get_target()
         )
@@ -155,6 +167,7 @@ class Staker:
         self.recompute_head()
         fast_confirmed_hash = get_fork_choice_head(
             self.chain,
+            self.get_current_slot(),
             self.latest_justified.hash,
             self.fast_votes,
             self.latest_slow_votes.values(),
@@ -176,11 +189,12 @@ class Staker:
         return current_block
 
     def get_target(self):
-        if self.latest_justified.checkpoint_slot + 1 == self.get_current_slot():
+        if self.latest_justified.epoch + 1 == self.get_current_epoch():
             target_block = self.chain[self.confirmed_hash]
         else:
             majority_hash = majority_fork_choice(
                 self.chain,
+                self.get_current_slot(),
                 self.latest_justified.hash,
                 self.latest_slow_votes.values()
             )
@@ -190,8 +204,8 @@ class Staker:
 
         return Checkpoint(
             hash=compute_hash(target_block),
-            chain_slot=target_block.slot,
-            checkpoint_slot=self.get_current_slot()
+            slot=target_block.slot,
+            epoch=self.get_current_epoch(),
         )
     
     # Called by the p2p network
@@ -216,7 +230,7 @@ class Staker:
                         if vote.slot != self.current_fast_vote_slot:
                             continue
                         self.fast_votes.add(vote)
-                        self.handle_fast_vote_equivocations(vote)
+                        self.check_fast_vote_equivocation(vote)
                     self.recompute_head()
                 # Receive slow votes
                 for vote in item.slow_votes:   
@@ -235,11 +249,24 @@ class Staker:
             if item.validator_id in self.equivocators:
                 return
             if item.target.hash in self.chain:
-                self.slow_votes.add(item)
-                self.handle_slow_vote_equivocations(item)
+                vote_epoch = item.target.epoch
+                vote_key = (item.validator_id, vote_epoch)
+                
+                # Already have a vote for this epoch, either already seen or an equivocation
+                if vote_key in self.slow_votes:
+                    # Check for equivocation: same validator making 
+                    # two different votes for same epoch
+                    if self.slow_votes[vote_key] != item:
+                        self.handle_equivocation(item.validator_id)
+                    return
+                
+                # Store the vote
+                self.slow_votes[vote_key] = item
+                
+                # Update latest slow vote if this is a newer vote
                 if (
                     item.validator_id not in self.latest_slow_votes
-                    or item.target.checkpoint_slot > self.latest_slow_votes[item.validator_id].target.checkpoint_slot
+                    or vote_epoch > self.latest_slow_votes[item.validator_id].target.epoch
                 ):
                     self.latest_slow_votes[item.validator_id] = item
             else:
@@ -251,11 +278,11 @@ class Staker:
                 return
             if item.head in self.chain:
                 self.fast_votes_buffer.add(item)
-                self.handle_fast_vote_equivocations(item)
+                self.check_fast_vote_equivocation(item)
             else:
                 self.dependencies.setdefault(item.head, []).append(item)
 
-    def handle_fast_vote_equivocations(self, vote: FastVote):
+    def check_fast_vote_equivocation(self, vote: FastVote):
         # Remove equivocations from fast votes
         fast_vote_counts = {}
         for vote in self.fast_votes_buffer.union(self.fast_votes):
@@ -263,37 +290,19 @@ class Staker:
         
         for validator_id, count in fast_vote_counts.items():
             if count > 1:
-                self.equivocators.add(validator_id)
+                self.handle_equivocation(validator_id)
 
-        # Remove votes from equivocators
+    def handle_equivocation(self, validator_id: int):
+        self.equivocators.add(validator_id)
+        self.latest_slow_votes.pop(validator_id, None)
         self.fast_votes_buffer = {
             vote for vote in self.fast_votes_buffer
             if vote.validator_id not in self.equivocators
         }
-
         self.fast_votes = {
             vote for vote in self.fast_votes 
             if validator_id not in self.equivocators
         }
-
-    def handle_slow_vote_equivocations(self, vote: SlowVote):
-        # Remove equivocations from latest slow votes
-        slow_vote_counts = {}
-        for vote in self.latest_slow_votes.values():
-            slow_vote_counts[vote.validator_id] = slow_vote_counts.get(vote.validator_id, 0) + 1
-        
-        for validator_id, count in slow_vote_counts.items():
-            if count > 1:
-                self.equivocators.add(validator_id)
-        
-        # Update the latest slow votes dictionary
-        for validator_id in self.latest_slow_votes.keys():
-            if validator_id in self.equivocators:
-                del self.latest_slow_votes[validator_id]
-
-
-
-
 
 # Simulates a p2p network
 class P2PNetwork:

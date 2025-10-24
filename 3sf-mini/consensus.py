@@ -5,7 +5,9 @@ import json
 import copy
 
 ZERO_HASH = '0'*64
-MAX_BACKOFF_INTERVAL_EXPONENT = 3
+MAX_BACKOFF_INTERVAL_EXPONENT = 4
+SLOTS_PER_EPOCH = 8
+SLOW_VOTE_EXPIRATION_SLOTS = 128
 
 # Chain configuration
 @dataclass
@@ -14,8 +16,8 @@ class Config:
 @dataclass(frozen=True)
 class Checkpoint:
     hash: str
-    chain_slot: int
-    checkpoint_slot: int
+    slot: int
+    epoch: int
 
 # Blockchain state
 @dataclass
@@ -36,7 +38,7 @@ class FastVote:
 @dataclass(frozen=True)
 class SlowVote:
     validator_id: int
-    finalized_slot: int
+    finalized_epoch: int
     source: Checkpoint
     target: Checkpoint
 
@@ -63,16 +65,19 @@ def compute_hash(obj: object):
         serialized = json.dumps(asdict(obj), sort_keys=True).encode()
     return hashlib.sha256(serialized).hexdigest()
 
-# Determines if slow voting should take place in a given slot, based on an exponential backoff mechanism (with a cap).
-# A backoff interval is calculated based on the distance from the last finalized slot, and slow voting should
-# only take place if the slot is a multiple of the interval. Slow votes carry a `finalized_slot`, and are invalid
+def slot_to_epoch(slot: int) -> int:
+    return slot // SLOTS_PER_EPOCH
+
+# Determines if slow voting should take place in a given epoch, based on an exponential backoff mechanism (with a cap).
+# A backoff interval is calculated based on the distance from the last finalized epoch, and slow voting should
+# only take place if the epoch is a multiple of the interval. Slow votes carry a `finalized_epoch`, and are invalid
 # if they violate this rule. The mechanism helps finality progress under high latency.
-def is_slow_voting_slot(finalized_slot: int, target_slot: int):
+def is_slow_voting_epoch(finalized_epoch: int, target_epoch: int):
     max_backoff_interval = 2**MAX_BACKOFF_INTERVAL_EXPONENT
-    delta = (target_slot - finalized_slot) * (MAX_BACKOFF_INTERVAL_EXPONENT - 1)
+    delta = (target_epoch - finalized_epoch) * (MAX_BACKOFF_INTERVAL_EXPONENT - 1)
     delta = delta // (2 * max_backoff_interval)
     backoff_interval = min(2**delta, max_backoff_interval)
-    return target_slot % backoff_interval == 0
+    return target_epoch % backoff_interval == 0
 
 # Given a state, output the new state after processing that block
 def process_block(state: State, block: Block) -> State:
@@ -85,18 +90,18 @@ def process_block(state: State, block: Block) -> State:
     for vote in block.slow_votes:
 
         if (
-            not is_slow_voting_slot(vote.finalized_slot, vote.target.checkpoint_slot)
-            or vote.source.checkpoint_slot < state.latest_finalized.checkpoint_slot
+            not is_slow_voting_epoch(vote.finalized_epoch, vote.target.epoch)
+            or vote.source.epoch < state.latest_finalized.epoch
             or vote.source not in state.justified_checkpoints
             or vote.target in state.justified_checkpoints
-            or vote.target.hash != state.historical_block_hashes[vote.target.chain_slot]
-            # or vote.target.chain_slot < vote.source.chain_slot
-            or vote.target.checkpoint_slot <= vote.source.checkpoint_slot
+            or vote.target.hash != state.historical_block_hashes[vote.target.slot]
+            or vote.target.slot < vote.source.slot
+            or vote.target.epoch <= vote.source.epoch
         ):
             continue
 
         # Track attempts to justify new hashes
-        justification_key = compute_hash((vote.finalized_slot, vote.source, vote.target))
+        justification_key = compute_hash((vote.finalized_epoch, vote.source, vote.target))
         if justification_key not in state.justifications:
             state.justifications[justification_key] = [False] * state.config.num_validators
 
@@ -113,16 +118,16 @@ def process_block(state: State, block: Block) -> State:
 
 
             # Finalization: if the target is the next valid slow voting
-            # slot after the source, wrt the finalized slot in the votes.
+            # epoch after the source, wrt the finalized epoch in the votes.
             if not any(
-                is_slow_voting_slot(vote.finalized_slot, slot)
-                for slot in range(vote.source.checkpoint_slot + 1, vote.target.checkpoint_slot)
+                is_slow_voting_epoch(vote.finalized_epoch, epoch)
+                for epoch in range(vote.source.epoch + 1, vote.target.epoch)
             ):
                 state.latest_finalized = vote.source
                 # Prune old checkpoints
                 state.justified_checkpoints = [
                     checkpoint for checkpoint in state.justified_checkpoints 
-                    if checkpoint.checkpoint_slot >= state.latest_finalized.checkpoint_slot
+                    if checkpoint.epoch >= state.latest_finalized.epoch
                 ]
 
     return state
@@ -131,26 +136,33 @@ def process_block(state: State, block: Block) -> State:
 def get_latest_justified_checkpoint(post_states: Dict[str, State]) -> Checkpoint:
     latest = max(   
         post_states.values(),
-        key=lambda s: s.latest_justified.checkpoint_slot
+        key=lambda s: s.latest_justified.epoch
     )
     return latest.latest_justified
 
 def get_fork_choice_head(blocks: Dict[str, Block],
+        slot: int,
         root: str,
         fast_votes: List[FastVote],
         latest_slow_votes: List[SlowVote],
         min_score: int = 0) -> str:
-    majority_fc_output = majority_fork_choice(blocks, root, latest_slow_votes)
+    majority_fc_output = majority_fork_choice(blocks, slot, root, latest_slow_votes)
     ghost_votes = [GHOSTVote(validator_id=vote.validator_id, head=vote.head) for vote in fast_votes]
     return ghost_fork_choice(blocks, majority_fc_output, ghost_votes, require_relative_majority=False, min_score=min_score)
 
 def majority_fork_choice(blocks: Dict[str, Block],
+        slot: int,
         root: str,
         latest_slow_votes: List[SlowVote]) -> str:
     # Start at genesis by default
     if root == ZERO_HASH:
         root = min(blocks.keys(), key=lambda block: blocks[block].slot)
-    ghost_votes = [GHOSTVote(validator_id=vote.validator_id, head=vote.target.hash) for vote in latest_slow_votes]
+    last_unexpired_epoch = slot_to_epoch(slot) - (SLOW_VOTE_EXPIRATION_SLOTS // SLOTS_PER_EPOCH)
+    ghost_votes = [
+        GHOSTVote(validator_id=vote.validator_id, head=vote.target.hash)
+        for vote in latest_slow_votes
+        if vote.target.epoch > last_unexpired_epoch
+    ]
     return ghost_fork_choice(blocks, root, ghost_votes, require_relative_majority=True)
 
 
