@@ -108,7 +108,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     # Color blocks
     justified_hash = get_latest_justified_checkpoint(staker.post_states).hash
     finalized_hash = staker.latest_finalized.hash
-    head_block = get_fork_choice_head(staker.chain, staker.get_current_slot(), justified_hash, staker.fast_votes, staker.latest_slow_votes.values())
+    head_block = get_fork_choice_head(staker.chain, staker.get_current_slot(), justified_hash, staker.fast_votes.values(), staker.latest_slow_votes.values())
 
     node_colors = []
     node_sizes = []
@@ -230,8 +230,8 @@ if __name__ == '__main__':
             if t < args.time // 4:
                 return 1
             elif t < 3 * args.time // 4:
+                random_factor = 2.5 * random.random() ** 3 if args.random_latency else 1
                 if args.latency is not None:
-                    random_factor = 2.5 * random.random() ** 3 if args.random_latency else 1
                     return (args.latency * SLOT_DURATION // 4) * random_factor
                 else:
                     return int(SLOT_DURATION * 2.5 * random.random() ** 3 * random_factor)
