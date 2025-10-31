@@ -31,13 +31,11 @@ class Staker:
         self.slow_votes: Dict[Tuple[int, int], SlowVote] = {}
         # Latest slow vote for each validator
         self.latest_slow_votes: Dict[int, SlowVote] = {}
-        # Accepted fast votes
+        # First-seen fast vote of each validator for the current slot
         self.fast_votes: Dict[int, FastVote] = {}
-        # Fast votes that have not been view-merged yet
-        self.fast_votes_buffer: Dict[int, FastVote] = {}
-        # Equivocators for the current slot
-        self.equivocators_buffer: Set[int] = set()
-        # Persistent equivocators
+        # Fast votes equivocation: second-seen vote per validator when equivocation detected
+        self.fast_votes_equivocation: Dict[int, FastVote] = {}
+        # Persistent equivocators (for slow votes)
         self.equivocators: Set[int] = set()
         # Objects that we will process once we have processed their parents
         self.dependencies: Dict[str, List[Block]] = {}
@@ -79,27 +77,26 @@ class Staker:
         # t=0: vote
         if time_in_slot == 0:
             self.fast_vote()
-        # t=2/4: confirm (done here to ensure that, assuming synchrony,
+        # t=1/4: confirm (done here to ensure that, assuming synchrony,
         # anything that one honest node receives by this time, every 
         # honest node will receive by the general view merging time). 
         # Also slow vote if it is the first slot of a slow voting epoch.
         elif time_in_slot == (SLOT_DURATION * 1) // 4:
-            self.merge_fast_votes()
             self.confirm()
             if self.should_slow_vote():
                 self.slow_vote()
-        # t=3/4: view-merge deadline
-        elif time_in_slot == (SLOT_DURATION * 2) // 4:
-            self.merge_fast_votes()
         # t=3/4: propose a block
         elif time_in_slot == (SLOT_DURATION * 3) // 4:
-            if self.get_current_slot() % self.num_validators == self.validator_id:
-                self.merge_fast_votes()
+            if self.is_proposer():
                 self.propose_block()
 
 
+    def is_proposer(self):
+        return self.get_current_slot() % self.num_validators == self.validator_id
+
     # Called when it's the staker's turn to propose a block
     def propose_block(self):
+        self.recompute_head()
         new_slot = self.get_current_slot()
         head_state = self.post_states[self.head]
         finalized_epoch = head_state.latest_finalized.epoch
@@ -107,11 +104,16 @@ class Staker:
                 vote for (_, epoch), vote in self.slow_votes.items()
                 if epoch > finalized_epoch
             ]
+        # Include all fast votes (both first-seen and equivocating)
+        fast_votes_to_include = (
+            list[FastVote](self.fast_votes.values())
+            + list[FastVote](self.fast_votes_equivocation.values())
+        )
         new_block = Block(
                 slot=new_slot,
                 parent=self.head,
                 slow_votes=slow_votes_to_include,
-                fast_votes=list(self.fast_votes.values()),
+                fast_votes=fast_votes_to_include,
             )
         state = process_block(head_state, new_block)
         new_block.state_root = compute_hash(state)
@@ -121,24 +123,19 @@ class Staker:
         self.post_states[new_hash] = state
         self.network.submit(new_block, self.validator_id)
 
+    # Get fast votes to use in fork choice (excluding equivocating votes)
+    def get_fast_votes_for_fork_choice(self):
+        """Returns fast votes excluding those from equivocating validators."""
+        return [vote for vid, vote in self.fast_votes.items() if vid not in self.fast_votes_equivocation]
+
     # Done upon processing new votes or a new block
     def recompute_head(self):
         root = self.latest_justified.hash
-        self.head = get_fork_choice_head(self.chain, self.get_current_slot(), root, self.fast_votes.values(), self.latest_slow_votes.values())
-
-    # Process new votes that the staker has received. Vote processing is done
-    # at a particular time, because of view-merge rules
-    def merge_fast_votes(self):
-        # Merge buffers into fork-choice view
-        self.fast_votes.update(self.fast_votes_buffer)
-        self.equivocators.update(self.equivocators_buffer)
-        # Clear buffers for the current slot
-        self.equivocators_buffer.clear()
-        self.fast_votes_buffer.clear()
-        self.recompute_head()
+        self.head = get_fork_choice_head(self.chain, self.get_current_slot(), root, self.get_fast_votes_for_fork_choice(), self.latest_slow_votes.values())
 
     # Called when it's the staker's turn to vote
     def fast_vote(self):
+        self.recompute_head()
         slot = self.get_current_slot()
         vote = FastVote(
             validator_id=self.validator_id,
@@ -147,8 +144,7 @@ class Staker:
         )
         
         self.fast_votes.clear()
-        self.fast_votes_buffer.clear()
-        self.equivocators_buffer.clear()
+        self.fast_votes_equivocation.clear()
         self.receive(vote)
         self.network.submit(vote, self.validator_id)
 
@@ -175,7 +171,7 @@ class Staker:
             self.chain,
             self.get_current_slot(),
             self.latest_justified.hash,
-            self.fast_votes.values(),
+            self.get_fast_votes_for_fork_choice(),
             self.latest_slow_votes.values(),
             min_score=self.num_validators * 3 // 4
         )
@@ -229,13 +225,11 @@ class Staker:
                 # Receive fast votes if the block is timely
                 timely_block = item.slot == self.get_current_slot()
                 if timely_block:
-                    # Clear the buffer, those votes are no longer needed
-                    self.fast_votes_buffer.clear()
-                    # Receive fast votes
+                    # Receive fast votes from block (always overwrite existing)
                     for vote in item.fast_votes:
                         self.receive_fast_vote(vote, from_block=True)
-                    # Merge buffer, to merge the received votes into fast_votes.
-                    self.merge_fast_votes()
+                    # Recompute head after receiving votes from block
+                    self.recompute_head()
                 # Receive slow votes
                 for vote in item.slow_votes:   
                     self.receive(vote)
@@ -279,38 +273,34 @@ class Staker:
             self.receive_fast_vote(item, from_block=False)
 
     def receive_fast_vote(self, vote: FastVote, from_block: bool = True):
+        # Only process votes for the current slot
         if vote.slot != self.get_current_slot():
             return
-        if vote.validator_id in self.equivocators:
-            return
-        # Do not filter out votes from equivocators 
-        # that are still in the buffer, if they come from the block.
-        if not from_block and vote.validator_id in self.equivocators_buffer:
+
+        # Ignore votes from known equivocators
+        if vote.validator_id in self.fast_votes_equivocation:
             return
 
-        # Check for equivocations
-        existing_vote = self.fast_votes.get(vote.validator_id)
-        if existing_vote is not None and existing_vote != vote:
-            # Since the equivocation is detected in fast_votes, we add the validator
-            # to the persistent equivocators set directly, without going through the buffer.
-            self.equivocators.add(vote.validator_id)
-        existing_vote = self.fast_votes_buffer.get(vote.validator_id)
-        if existing_vote is not None and existing_vote != vote:
-            # Since the equivocation is detected in fast_votes_buffer, 
-            # we add the validator to the equivocators buffer first.
-            self.equivocators_buffer.add(vote.validator_id)
+        # Non-proposers ignore votes after the view-merge
+        # deadline unless they are from a block.
+        time_in_slot = (self.network.time % SLOT_DURATION)
+        if time_in_slot > (SLOT_DURATION * 2) // 4:
+            if not from_block and not self.is_proposer():
+                return
 
-        # Add vote to buffer, to be merged into fast_votes later.
-        self.fast_votes_buffer[vote.validator_id] = vote
+        # Record the vote if it is the first-seen
+        if vote.validator_id not in self.fast_votes:
+            self.fast_votes[vote.validator_id] = vote
+            return
         
-
-
+        # If one has been seen, check for equivocation
+        if self.fast_votes[vote.validator_id] != vote:
+            self.fast_votes_equivocation[vote.validator_id] = vote
+            self.handle_equivocation(vote.validator_id)
 
     def handle_equivocation(self, validator_id: int):
         self.equivocators.add(validator_id)
         self.latest_slow_votes.pop(validator_id, None)
-        self.fast_votes_buffer.pop(validator_id, None)
-        self.fast_votes.pop(validator_id, None)
 
 # Simulates a p2p network
 class P2PNetwork:

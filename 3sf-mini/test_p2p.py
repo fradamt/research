@@ -108,7 +108,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     # Color blocks
     justified_hash = get_latest_justified_checkpoint(staker.post_states).hash
     finalized_hash = staker.latest_finalized.hash
-    head_block = get_fork_choice_head(staker.chain, staker.get_current_slot(), justified_hash, staker.fast_votes.values(), staker.latest_slow_votes.values())
+    head_block = get_fork_choice_head(staker.chain, staker.get_current_slot(), justified_hash, staker.get_fast_votes_for_fork_choice(), staker.latest_slow_votes.values())
 
     node_colors = []
     node_sizes = []
