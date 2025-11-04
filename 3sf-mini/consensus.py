@@ -6,13 +6,13 @@ import copy
 
 ZERO_HASH = '0'*64
 MAX_BACKOFF_INTERVAL_EXPONENT = 4
-SLOTS_PER_EPOCH = 8
-SLOW_VOTE_EXPIRATION_SLOTS = 128
+SLOW_VOTE_EXPIRATION_EPOCHS = 64
 
 # Chain configuration
 @dataclass
 class Config:
     num_validators: int
+    slots_per_epoch: int = 4
 @dataclass(frozen=True)
 class Checkpoint:
     hash: str
@@ -65,8 +65,8 @@ def compute_hash(obj: object):
         serialized = json.dumps(asdict(obj), sort_keys=True).encode()
     return hashlib.sha256(serialized).hexdigest()
 
-def slot_to_epoch(slot: int) -> int:
-    return slot // SLOTS_PER_EPOCH
+def slot_to_epoch(slot: int, config: Config) -> int:
+    return slot // config.slots_per_epoch
 
 # Determines if slow voting should take place in a given epoch, based on an exponential backoff mechanism (with a cap).
 # A backoff interval is calculated based on the distance from the last finalized epoch, and slow voting should
@@ -151,13 +151,13 @@ def get_fork_choice_head(blocks: Dict[str, Block],
     return ghost_fork_choice(blocks, majority_fc_output, ghost_votes, require_relative_majority=False, min_score=min_score)
 
 def majority_fork_choice(blocks: Dict[str, Block],
-        slot: int,
+        epoch: int,
         root: str,
         latest_slow_votes: List[SlowVote]) -> str:
     # Start at genesis by default
     if root == ZERO_HASH:
         root = min(blocks.keys(), key=lambda block: blocks[block].slot)
-    last_unexpired_epoch = slot_to_epoch(slot) - (SLOW_VOTE_EXPIRATION_SLOTS // SLOTS_PER_EPOCH)
+    last_unexpired_epoch = epoch - SLOW_VOTE_EXPIRATION_EPOCHS
     ghost_votes = [
         GHOSTVote(validator_id=vote.validator_id, head=vote.target.hash)
         for vote in latest_slow_votes

@@ -201,6 +201,7 @@ if __name__ == '__main__':
     parser.add_argument('--time', type=int, default=1000, help='Number of time steps to run')
     parser.add_argument('--no-viz', action='store_true', help='Disable interactive graph visualization')
     parser.add_argument('--random-latency', action='store_true', help='Randomize latency function')
+    parser.add_argument('--slots-per-epoch', type=int, default=4, help='Number of slots per epoch')
     args = parser.parse_args()
 
     SLOT_DURATION = 12
@@ -215,7 +216,7 @@ if __name__ == '__main__':
 
     # Create genesis block and state
     genesis_block = Block(slot=1, parent=ZERO_HASH)
-    config = Config(num_validators=NUM_STAKERS)
+    config = Config(num_validators=NUM_STAKERS, slots_per_epoch=args.slots_per_epoch)
     genesis_state = State(
         config=config,
         latest_justified=Checkpoint(hash=ZERO_HASH, slot=0, epoch=0),
@@ -280,10 +281,10 @@ if __name__ == '__main__':
                 ljh = staker.latest_justified.hash
                 lfe = staker.latest_finalized.epoch
                 lfh = staker.latest_finalized.hash
-                target = staker.get_target()
+                target = staker.get_target_checkpoint()
                 tbh = target.hash
                 tbs = target.slot
-                current_epoch = slot_to_epoch(time // SLOT_DURATION + 2)
+                current_epoch = slot_to_epoch(time // SLOT_DURATION + 2, config)
                 slow_voting_epoch = is_slow_voting_epoch(lfe, current_epoch)
                 if slow_voting_epoch:
                     print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} (Epoch: {lje}) | Finalized={lfh[:8]} (Epoch: {lfe}) | Slow voting slot")

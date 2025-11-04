@@ -7,7 +7,7 @@ import copy
 from consensus import (
     State, SlowVote, FastVote, Block, Checkpoint, majority_fork_choice,
     process_block, get_latest_justified_checkpoint, get_fork_choice_head,
-    compute_hash, is_slow_voting_epoch, slot_to_epoch, SLOTS_PER_EPOCH
+    compute_hash, is_slow_voting_epoch, slot_to_epoch
 )
 from collections import defaultdict
 
@@ -43,7 +43,7 @@ class Staker:
         self.genesis_hash = compute_hash(genesis_block)
         self.chain[self.genesis_hash] = genesis_block
         self.post_states[self.genesis_hash] = genesis_state
-        self.num_validators = genesis_state.config.num_validators
+        self.config = genesis_state.config
         # Block that it is safe to use to vote as the target
         self.confirmed_hash: str = self.genesis_hash
         # Head of the chain
@@ -69,7 +69,7 @@ class Staker:
         return self.network.time // SLOT_DURATION + 2
 
     def get_current_epoch(self):
-        return slot_to_epoch(self.get_current_slot())
+        return slot_to_epoch(self.get_current_slot(), self.config)
 
     # Called every second
     def tick(self):
@@ -92,7 +92,7 @@ class Staker:
 
 
     def is_proposer(self):
-        return self.get_current_slot() % self.num_validators == self.validator_id
+        return self.get_current_slot() % self.config.num_validators == self.validator_id
 
     # Called when it's the staker's turn to propose a block
     def propose_block(self):
@@ -131,7 +131,13 @@ class Staker:
     # Done upon processing new votes or a new block
     def recompute_head(self):
         root = self.latest_justified.hash
-        self.head = get_fork_choice_head(self.chain, self.get_current_slot(), root, self.get_fast_votes_for_fork_choice(), self.latest_slow_votes.values())
+        self.head = get_fork_choice_head(
+            blocks=self.chain,
+            slot=self.get_current_slot(),
+            root=root,
+            fast_votes=self.get_fast_votes_for_fork_choice(),
+            latest_slow_votes=self.latest_slow_votes.values()
+        )
 
     # Called when it's the staker's turn to vote
     def fast_vote(self):
@@ -149,7 +155,7 @@ class Staker:
         self.network.submit(vote, self.validator_id)
 
     def should_slow_vote(self):
-        first_slot_of_epoch = self.get_current_slot() % SLOTS_PER_EPOCH == 0
+        first_slot_of_epoch = self.get_current_slot() % self.config.slots_per_epoch == 0
         slow_voting_epoch = is_slow_voting_epoch(self.latest_finalized.epoch, self.get_current_epoch())
         return first_slot_of_epoch and slow_voting_epoch
 
@@ -159,7 +165,7 @@ class Staker:
             validator_id=self.validator_id,
             finalized_epoch=self.latest_finalized.epoch,
             source=self.latest_justified,
-            target=self.get_target()
+            target=self.get_target_checkpoint()
         )
         
         self.receive(vote)
@@ -173,7 +179,7 @@ class Staker:
             self.latest_justified.hash,
             self.get_fast_votes_for_fork_choice(),
             self.latest_slow_votes.values(),
-            min_score=self.num_validators * 3 // 4
+            min_score=self.config.num_validators * 3 // 4
         )
         fast_confirmed_block = self.chain[fast_confirmed_hash]
         if fast_confirmed_block.slot >= self.get_current_slot() - KAPPA:
@@ -190,13 +196,13 @@ class Staker:
             current_block = self.chain[current_block.parent]
         return current_block
 
-    def get_target(self):
+    def get_target_checkpoint(self):
         if self.latest_justified.epoch + 1 == self.get_current_epoch():
             target_block = self.chain[self.confirmed_hash]
         else:
             majority_hash = majority_fork_choice(
                 self.chain,
-                self.get_current_slot(),
+                self.get_current_epoch(),
                 self.latest_justified.hash,
                 self.latest_slow_votes.values()
             )
