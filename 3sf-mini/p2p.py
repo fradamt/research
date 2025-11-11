@@ -222,6 +222,7 @@ class Staker:
             validator_id=self.validator_id,
             slot=self.get_current_slot(),
             head=self.head,
+            payload_available=True, # no payload for now, TODO: add payload
         )
         
         self.receive(vote)

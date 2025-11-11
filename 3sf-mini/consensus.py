@@ -29,16 +29,18 @@ class State:
     justifications: Dict[str, List[bool]] = field(default_factory=dict)
 
 @dataclass(frozen=True)
-class BeaconVote:
+class FastVote:
     validator_id: int
     slot: int
     head: str
 
 @dataclass(frozen=True)
-class PayloadVote:
-    validator_id: int
-    slot: int
-    head: str
+class BeaconVote(FastVote):
+    pass
+
+@dataclass(frozen=True)
+class PayloadVote(FastVote):
+    payload_available: bool
 
 @dataclass(frozen=True)
 class SlowVote:
@@ -46,8 +48,6 @@ class SlowVote:
     finalized_epoch: int
     source: Checkpoint
     target: Checkpoint
-
-FastVote = BeaconVote | PayloadVote
 @dataclass
 class GHOSTVote:
     validator_id: int
