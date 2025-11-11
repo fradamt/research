@@ -3,11 +3,10 @@ from consensus import (
     get_latest_justified_checkpoint, get_fork_choice_head,
     compute_hash, is_slow_voting_epoch, slot_to_epoch
 )
-from p2p import Staker, P2PNetwork
+from p2p import Staker, P2PNetwork, SLOT_DURATION
 import random
 import argparse
 
-SLOT_DURATION = 12
 NUM_STAKERS = 10
 ZERO_HASH = '0'*64
 
@@ -108,7 +107,6 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     # Color blocks
     justified_hash = get_latest_justified_checkpoint(staker.post_states).hash
     finalized_hash = staker.latest_finalized.hash
-    head_block = get_fork_choice_head(staker.chain, staker.get_current_slot(), justified_hash, staker.get_fast_votes_for_fork_choice(), staker.latest_slow_votes.values())
 
     node_colors = []
     node_sizes = []
@@ -119,7 +117,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
         elif node == finalized_hash[:8]:
             node_colors.append("purple")
             node_sizes.append(600)
-        elif node == head_block[:8]:
+        elif node == staker.head[:8]:
             node_colors.append("green")
             node_sizes.append(600)
         else:
@@ -203,9 +201,6 @@ if __name__ == '__main__':
     parser.add_argument('--random-latency', action='store_true', help='Randomize latency function')
     parser.add_argument('--slots-per-epoch', type=int, default=4, help='Number of slots per epoch')
     args = parser.parse_args()
-
-    SLOT_DURATION = 12
-    NUM_STAKERS = 10
 
     if not args.no_viz:
         fig, ax = plt.subplots(figsize=(10, 8))

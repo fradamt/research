@@ -30,7 +30,13 @@ class State:
     justifications: Dict[str, List[bool]] = field(default_factory=dict)
 
 @dataclass(frozen=True)
-class FastVote:
+class BeaconVote:
+    validator_id: int
+    slot: int
+    head: str
+
+@dataclass(frozen=True)
+class PayloadVote:
     validator_id: int
     slot: int
     head: str
@@ -42,6 +48,7 @@ class SlowVote:
     source: Checkpoint
     target: Checkpoint
 
+FastVote = BeaconVote | PayloadVote
 @dataclass
 class GHOSTVote:
     validator_id: int
@@ -52,7 +59,7 @@ class GHOSTVote:
 class Block:
     slot: int
     parent: Optional[str]
-    fast_votes: List[FastVote] = field(default_factory=list)
+    payload_votes: List[PayloadVote] = field(default_factory=list)
     slow_votes: List[SlowVote] = field(default_factory=list)
     state_root: Optional[str] = None
 
@@ -148,7 +155,7 @@ def get_fork_choice_head(blocks: Dict[str, Block],
         min_score: int = 0) -> str:
     majority_fc_output = majority_fork_choice(blocks, slot, root, latest_slow_votes)
     ghost_votes = [GHOSTVote(validator_id=vote.validator_id, head=vote.head) for vote in fast_votes]
-    return ghost_fork_choice(blocks, majority_fc_output, ghost_votes, require_relative_majority=False, min_score=min_score)
+    return ghost_fork_choice(blocks, majority_fc_output, ghost_votes, min_score=min_score, max_slot=slot)
 
 def majority_fork_choice(blocks: Dict[str, Block],
         epoch: int,
@@ -163,14 +170,15 @@ def majority_fork_choice(blocks: Dict[str, Block],
         for vote in latest_slow_votes
         if vote.target.epoch > last_unexpired_epoch
     ]
-    return ghost_fork_choice(blocks, root, ghost_votes, require_relative_majority=True)
+    majority_threshold = (len(ghost_votes)+1) // 2
+    return ghost_fork_choice(blocks, root, ghost_votes, min_score=majority_threshold + 1)
 
 
 def ghost_fork_choice(blocks: Dict[str, Block],
         root: str,
         votes: List[GHOSTVote],
-        require_relative_majority: bool,
-        min_score: int = 0) -> str:
+        min_score: int = 0,
+        max_slot: int = None) -> str:
 
     # For each block, count the number of votes for that block. A vote
     # for any descendant of a block also counts as a vote for that block
@@ -196,8 +204,6 @@ def ghost_fork_choice(blocks: Dict[str, Block],
     current = root
     while True:
         children = children_map.get(current, [])
-        if require_relative_majority:
-            children = [child for child in children if vote_weights.get(child, 0) * 2 > total_weight]
         if not children:
             return current
         current = max(children,
