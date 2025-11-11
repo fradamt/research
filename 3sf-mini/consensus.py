@@ -6,7 +6,6 @@ import copy
 
 ZERO_HASH = '0'*64
 MAX_BACKOFF_INTERVAL_EXPONENT = 4
-SLOW_VOTE_EXPIRATION_EPOCHS = 64
 
 # Chain configuration
 @dataclass
@@ -147,29 +146,23 @@ def get_latest_justified_checkpoint(post_states: Dict[str, State]) -> Checkpoint
     )
     return latest.latest_justified
 
+
 def get_fork_choice_head(blocks: Dict[str, Block],
-        slot: int,
         root: str,
         fast_votes: List[FastVote],
-        latest_slow_votes: List[SlowVote],
+        slow_votes: List[SlowVote],
         min_score: int = 0) -> str:
-    majority_fc_output = majority_fork_choice(blocks, slot, root, latest_slow_votes)
+    majority_fc_output = majority_fork_choice(blocks, root, slow_votes)
     ghost_votes = [GHOSTVote(validator_id=vote.validator_id, head=vote.head) for vote in fast_votes]
-    return ghost_fork_choice(blocks, majority_fc_output, ghost_votes, min_score=min_score, max_slot=slot)
+    return ghost_fork_choice(blocks, majority_fc_output, ghost_votes, min_score=min_score)
 
 def majority_fork_choice(blocks: Dict[str, Block],
-        epoch: int,
         root: str,
-        latest_slow_votes: List[SlowVote]) -> str:
+        slow_votes: List[SlowVote]) -> str:
     # Start at genesis by default
     if root == ZERO_HASH:
         root = min(blocks.keys(), key=lambda block: blocks[block].slot)
-    last_unexpired_epoch = epoch - SLOW_VOTE_EXPIRATION_EPOCHS
-    ghost_votes = [
-        GHOSTVote(validator_id=vote.validator_id, head=vote.target.hash)
-        for vote in latest_slow_votes
-        if vote.target.epoch > last_unexpired_epoch
-    ]
+    ghost_votes = [GHOSTVote(validator_id=vote.validator_id, head=vote.target.hash) for vote in slow_votes]
     majority_threshold = (len(ghost_votes)+1) // 2
     return ghost_fork_choice(blocks, root, ghost_votes, min_score=majority_threshold + 1)
 
@@ -177,8 +170,7 @@ def majority_fork_choice(blocks: Dict[str, Block],
 def ghost_fork_choice(blocks: Dict[str, Block],
         root: str,
         votes: List[GHOSTVote],
-        min_score: int = 0,
-        max_slot: int = None) -> str:
+        min_score: int = 0) -> str:
 
     # For each block, count the number of votes for that block. A vote
     # for any descendant of a block also counts as a vote for that block
