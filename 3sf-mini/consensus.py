@@ -6,6 +6,9 @@ import copy
 
 ZERO_HASH = '0'*64
 MAX_BACKOFF_INTERVAL_EXPONENT = 4
+EPOCHS_FOR_LONG_EXPIRATION_PERIOD = 64
+EPOCHS_FOR_SHORT_EXPIRATION_PERIOD = 2
+
 
 # Chain configuration
 @dataclass
@@ -48,6 +51,7 @@ class SlowVote:
     finalized_epoch: int
     source: Checkpoint
     target: Checkpoint
+    head: str
 @dataclass
 class GHOSTVote:
     validator_id: int
@@ -61,6 +65,7 @@ class Block:
     payload_votes: List[PayloadVote] = field(default_factory=list)
     slow_votes: List[SlowVote] = field(default_factory=list)
     state_root: Optional[str] = None
+    parent_has_payload: bool = False
 
 # Stub for computing block hash, state root...
 # (in real life replace with SSZ hashing)
@@ -147,14 +152,15 @@ def get_latest_justified_checkpoint(post_states: Dict[str, State]) -> Checkpoint
     return latest.latest_justified
 
 
+
 def get_fork_choice_head(blocks: Dict[str, Block],
         root: str,
         fast_votes: List[FastVote],
         slow_votes: List[SlowVote],
         min_score: int = 0) -> str:
-    majority_fc_output = majority_fork_choice(blocks, root, slow_votes)
+    root = majority_fork_choice(blocks, root, slow_votes)
     ghost_votes = [GHOSTVote(validator_id=vote.validator_id, head=vote.head) for vote in fast_votes]
-    return ghost_fork_choice(blocks, majority_fc_output, ghost_votes, min_score=min_score)
+    return ghost_fork_choice(blocks, root, ghost_votes, min_score=min_score)
 
 def majority_fork_choice(blocks: Dict[str, Block],
         root: str,
@@ -162,9 +168,25 @@ def majority_fork_choice(blocks: Dict[str, Block],
     # Start at genesis by default
     if root == ZERO_HASH:
         root = min(blocks.keys(), key=lambda block: blocks[block].slot)
-    ghost_votes = [GHOSTVote(validator_id=vote.validator_id, head=vote.target.hash) for vote in slow_votes]
-    majority_threshold = (len(ghost_votes)+1) // 2
-    return ghost_fork_choice(blocks, root, ghost_votes, min_score=majority_threshold + 1)
+    if len(slow_votes) == 0:
+        return root
+
+    max_epoch = max(vote.target.epoch for vote in slow_votes)
+    long_expiration_ghost_votes = [
+        GHOSTVote(validator_id=vote.validator_id, head=vote.head)
+        for vote in slow_votes
+        if vote.target.epoch >= max_epoch - EPOCHS_FOR_LONG_EXPIRATION_PERIOD
+    ]
+    majority_threshold = (len(long_expiration_ghost_votes)+1) // 2
+    root = ghost_fork_choice(blocks, root, long_expiration_ghost_votes, min_score=majority_threshold + 1)
+
+    short_expiration_ghost_votes = [
+        GHOSTVote(validator_id=vote.validator_id, head=vote.head)
+        for vote in slow_votes
+        if vote.target.epoch >= max_epoch - EPOCHS_FOR_SHORT_EXPIRATION_PERIOD
+    ]
+    majority_threshold = (len(short_expiration_ghost_votes)+1) // 2
+    return ghost_fork_choice(blocks, root, short_expiration_ghost_votes, min_score=majority_threshold + 1)
 
 
 def ghost_fork_choice(blocks: Dict[str, Block],

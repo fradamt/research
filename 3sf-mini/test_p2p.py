@@ -1,6 +1,7 @@
+from re import S
 from consensus import (
     State, Block, Config, Checkpoint,
-    get_latest_justified_checkpoint, get_fork_choice_head,
+    get_latest_justified_checkpoint, get_fork_choice_head, majority_fork_choice,
     compute_hash, is_slow_voting_epoch, slot_to_epoch
 )
 from p2p import Staker, P2PNetwork, SLOT_DURATION
@@ -175,14 +176,15 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     fig.canvas.draw()
     fig.canvas.flush_events()
 
-def plot_progression(confirmed_slots, justified_slots, finalized_slots):
+def plot_progression(confirmed_slots, justified_slots, finalized_slots, canonical_slots, majority_slots):
     plt.figure(figsize=(12, 6))
     
     plt.plot(range(2, len(justified_slots) + 2), label='Slot', color='green', linestyle='--')
+    plt.plot(canonical_slots, label='Max Canonical Slot', color='orange')
     plt.plot(confirmed_slots, label='Max Confirmed Slot', color='red')
+    plt.plot(majority_slots, label='Max Majority Slot', color='purple')
     plt.plot(justified_slots, label='Max Justified Slot', color='blue')
-    plt.plot(finalized_slots, label='Max Finalized Slot', color='purple')
-    
+    plt.plot(finalized_slots, label='Max Finalized Slot', color='green')
     plt.xlabel('Time (simulation slots elapsed)')
     plt.ylabel('Slot Number')
     plt.title('Progression of Confirmed, Justified, and Finalized Slots')
@@ -200,6 +202,7 @@ if __name__ == '__main__':
     parser.add_argument('--no-viz', action='store_true', help='Disable interactive graph visualization')
     parser.add_argument('--random-latency', action='store_true', help='Randomize latency function')
     parser.add_argument('--slots-per-epoch', type=int, default=4, help='Number of slots per epoch')
+    parser.add_argument('--low-participation', action='store_true', help='During [1/4, 3/4] of simulation, only 1/3 of nodes are online')
     args = parser.parse_args()
 
     if not args.no_viz:
@@ -228,7 +231,8 @@ if __name__ == '__main__':
             elif t < 3 * args.time // 4:
                 random_factor = 2.5 * random.random() ** 3 if args.random_latency else 1
                 if args.latency is not None:
-                    return (args.latency * SLOT_DURATION // 4) * random_factor
+                    # Ensure minimum latency of 1 to avoid timing issues with message delivery
+                    return max(1, (args.latency * SLOT_DURATION // 5) * random_factor)
                 else:
                     return int(SLOT_DURATION * 2.5 * random.random() ** 3 * random_factor)
             else:
@@ -243,34 +247,56 @@ if __name__ == '__main__':
         assert staker.head == genesis_hash
 
     # Initialize data collection for progression plot
+    canonical_slots = []
     confirmed_slots = []
+    majority_slots = []
     justified_slots = []
     finalized_slots = []
     actual_slots_data = [] # New list for actual slots
 
     # Simulation loop
     for time in range(args.time):
-
+        # Check if we're in the low participation period
+        in_low_participation = args.low_participation and (args.time // 4 <= time < 3 * args.time // 4)
+        online_stakers_ids = range(max(1, NUM_STAKERS // 3)) if in_low_participation else range(NUM_STAKERS)
+        online_stakers = [stakers[i] for i in online_stakers_ids]
+        
         # Run staker code
-        for staker in stakers:
+        for staker in online_stakers:
             staker.tick()
 
         # Deliver messages
         network.time_step()
 
         # Periodic printout and data collection
-        if time % SLOT_DURATION == 2 * SLOT_DURATION // 4:
+        if time % SLOT_DURATION == 4 * SLOT_DURATION // 5:
+
+            majority_hashes = []
+            for staker in online_stakers:
+                majority_hash = majority_fork_choice(
+                    staker.chain,
+                    staker.latest_justified.hash,
+                    staker.latest_slow_votes.values()
+                )
+                majority_hashes.append(majority_hash)
+
+
+
             current_slot = time // SLOT_DURATION + 2
-            max_confirmed = max(staker.chain[staker.confirmed_hash].slot for staker in stakers)
-            max_justified = max(staker.latest_justified.slot for staker in stakers)
-            max_finalized = max(staker.latest_finalized.slot for staker in stakers)
+            max_canonical = max(staker.chain[staker.head].slot for staker in online_stakers)
+            max_confirmed = max(staker.chain[staker.confirmed_hash].slot for staker in online_stakers)
+            max_majority = max(staker.chain[majority_hash].slot for majority_hash in majority_hashes)
+            max_justified = max(staker.latest_justified.slot for staker in online_stakers)
+            max_finalized = max(staker.latest_finalized.slot for staker in online_stakers)
+            canonical_slots.append(max_canonical)
             confirmed_slots.append(max_confirmed)
+            majority_slots.append(max_majority)
             justified_slots.append(max_justified)
             finalized_slots.append(max_finalized)
             actual_slots_data.append(current_slot) # Store current slot
 
             print(f"\n=== Time {time}, Slot {time // SLOT_DURATION + 2} === ")
-            for staker in stakers:
+            for staker in online_stakers:
                 head = staker.head
                 lje = staker.latest_justified.epoch
                 ljh = staker.latest_justified.hash
@@ -280,9 +306,8 @@ if __name__ == '__main__':
                 tbh = target.hash
                 tbs = target.slot
                 current_epoch = slot_to_epoch(time // SLOT_DURATION + 2, config)
-                slow_voting_epoch = is_slow_voting_epoch(lfe, current_epoch)
-                if slow_voting_epoch:
-                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} (Epoch: {lje}) | Finalized={lfh[:8]} (Epoch: {lfe}) | Slow voting slot")
+                if staker.should_slow_vote():
+                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} (Epoch: {lje}) | Finalized={lfh[:8]} (Epoch: {lfe}) | Slow voting epoch")
                 else:
                     print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} (Epoch: {lje}) | Finalized={lfh[:8]} (Epoch: {lfe}) | Not slow voting slot")
         if not args.no_viz and time % 60 == 9:
@@ -292,5 +317,5 @@ if __name__ == '__main__':
         plt.ioff() # Turn off interactive mode before the final blocking show
 
     # Plot the progression at the end
-    plot_progression(confirmed_slots, justified_slots, finalized_slots)
+    plot_progression(confirmed_slots, justified_slots, finalized_slots, canonical_slots, majority_slots)
     plt.show()  # Show all figures and block until closed

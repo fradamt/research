@@ -16,7 +16,6 @@ ConsensusObject = Union[Block, BeaconVote, PayloadVote, SlowVote]
 SLOT_DURATION = 10  # time units
 ZERO_HASH = '0'*64
 KAPPA = 32
-SLOW_VOTE_EXPIRATION_EPOCHS = 64
 
 
 
@@ -108,12 +107,11 @@ class Staker:
     def propose(self):
         root = self.latest_justified.hash
         slot = self.get_current_slot() + 1
-        epoch = slot_to_epoch(slot, self.config)
         self.head = get_fork_choice_head(
             blocks=self.chain,
             root=root,
             fast_votes=self.get_payload_votes_for_fork_choice(),
-            slow_votes=self.get_slow_votes_for_fork_choice(epoch),
+            slow_votes=self.latest_slow_votes.values(),
         )
         head_state = self.post_states[self.head]
         finalized_epoch = head_state.latest_finalized.epoch
@@ -141,13 +139,12 @@ class Staker:
         self.network.submit(new_block, self.validator_id)
 
     def beacon_vote(self):
-        epoch = self.get_current_epoch()
         root = self.latest_justified.hash
         self.head = get_fork_choice_head(
             blocks=self.chain,
             root=root,
             fast_votes=self.get_payload_votes_for_fork_choice(),
-            slow_votes=self.get_slow_votes_for_fork_choice(epoch)
+            slow_votes=self.latest_slow_votes.values()
         )
         vote = BeaconVote(
             validator_id=self.validator_id,
@@ -158,7 +155,6 @@ class Staker:
         # Clear payload vote trackers
         self.payload_votes.clear()
         self.payload_vote_equivocations.clear()
-        self.receive(vote)
         self.network.submit(vote, self.validator_id)
 
 
@@ -167,17 +163,16 @@ class Staker:
             validator_id=self.validator_id,
             finalized_epoch=self.latest_finalized.epoch,
             source=self.latest_justified,
-            target=self.get_target_checkpoint()
+            target=self.get_target_checkpoint(),
+            head=self.confirmed_hash
         )
         
-        self.receive(vote)
         self.network.submit(vote, self.validator_id)
 
     def fast_confirm(self):
-        epoch = self.get_current_epoch()
         root = self.latest_justified.hash
         beacon_votes = self.get_beacon_votes_for_fork_choice()
-        latest_slow_votes = self.get_slow_votes_for_fork_choice(epoch)
+        latest_slow_votes = self.latest_slow_votes.values()
 
         self.head = get_fork_choice_head(
             blocks=self.chain,
@@ -202,7 +197,6 @@ class Staker:
 
 
     def payload_vote(self):
-        epoch = self.get_current_epoch()
         beacon_votes = self.get_beacon_votes_for_fork_choice()
         equivocations = len(self.beacon_vote_equivocations)
         # Majority threshold including all received votes (equivocations as well)
@@ -215,7 +209,7 @@ class Staker:
             blocks=self.chain,
             root=self.latest_justified.hash,
             fast_votes=beacon_votes,
-            slow_votes=self.get_slow_votes_for_fork_choice(epoch),
+            slow_votes=self.latest_slow_votes.values(),
             min_score=min_score,
         )
         vote = PayloadVote(
@@ -225,21 +219,20 @@ class Staker:
             payload_available=True, # no payload for now, TODO: add payload
         )
         
-        self.receive(vote)
+
         self.network.submit(vote, self.validator_id)
 
 
     def available_confirm(self):
         if self.confirmed_hash != self.head:
-            epoch = self.get_current_epoch()
             beacon_votes = self.get_beacon_votes_for_fork_choice()
-            timely_beacon_votes = [vote for vote in beacon_votes if vote.validator_id in self.timely_beacon_voters]
+            timely_beacon_votes = [vote for vote in beacon_votes if self.timely_beacon_voters[vote.validator_id]]
             total_votes = len(beacon_votes) + len(self.beacon_vote_equivocations)
             majority_threshold = (total_votes+1) // 2
             new_confirmed_hash = get_fork_choice_head(
                 blocks=self.chain,
                 root=self.latest_justified.hash,
-                slow_votes=self.get_slow_votes_for_fork_choice(epoch),
+                slow_votes=self.latest_slow_votes.values(),
                 fast_votes=timely_beacon_votes,
                 min_score=majority_threshold + 1,
             )
@@ -260,13 +253,6 @@ class Staker:
     def get_payload_votes_for_fork_choice(self):
         """Returns payload votes excluding those from equivocating validators."""
         return [vote for vid, vote in self.payload_votes.items() if vid not in self.payload_vote_equivocations]
-    
-    # Get slow votes to use in fork choice (latest unexpired)
-    def get_slow_votes_for_fork_choice(self, epoch: int):
-        return [
-            vote for vote in self.latest_slow_votes.values()
-            if epoch - vote.target.epoch <= SLOW_VOTE_EXPIRATION_EPOCHS
-        ]
         
     def should_slow_vote(self):
         first_slot_of_epoch = self.get_current_slot() % self.config.slots_per_epoch == 0
@@ -284,11 +270,10 @@ class Staker:
         if self.latest_justified.epoch + 1 == self.get_current_epoch():
             target_hash = self.confirmed_hash
         else:
-            epoch = self.get_current_epoch()
             majority_hash = majority_fork_choice(
                 self.chain,
                 self.latest_justified.hash,
-                self.get_slow_votes_for_fork_choice(epoch)
+                self.latest_slow_votes.values()
             )
             majority_block = self.chain[majority_hash]
             kappa_deep_slot = self.get_current_slot() - KAPPA
@@ -483,8 +468,9 @@ class P2PNetwork:
 
     def submit(self, item: ConsensusObject, sender_id: int):
         for recipient_id, _ in self.stakers.items():
+            # Immediately receive your own messages
             if recipient_id == sender_id:
-                continue
+                self.stakers[recipient_id].receive(item)
             deliver_at = self.time + self.latency_func(self.time)
             self.queues[recipient_id].append((deliver_at, item))
 
