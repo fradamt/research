@@ -8,6 +8,12 @@ ZERO_HASH = '0'*64
 MAX_BACKOFF_INTERVAL_EXPONENT = 4
 EPOCHS_FOR_LONG_EXPIRATION_PERIOD = 64
 EPOCHS_FOR_SHORT_EXPIRATION_PERIOD = 2
+FINALIZATION_THRESHOLD_NUMERATOR = 5
+FINALIZATION_THRESHOLD_DENOMINATOR = 6
+JUSTIFICATION_THRESHOLD_NUMERATOR = 1
+JUSTIFICATION_THRESHOLD_DENOMINATOR = 2
+SKIP_THRESHOLD_NUMERATOR = 1
+SKIP_THRESHOLD_DENOMINATOR = 3
 
 
 # Chain configuration
@@ -29,9 +35,8 @@ class State:
     latest_justified: Checkpoint
     height: int
     historical_block_hashes: List[str] = field(default_factory=list)
-    height_to_target_hash: Dict[str, List[Optional[str]]] = field(default_factory=dict)
-    max_count_for_height: Dict[str, int] = field(default_factory=dict)
-    max_hash_for_height: Dict[str, str] = field(default_factory=dict)
+    height_to_target_hash: Dict[int, List[Optional[str]]] = field(default_factory=dict)
+    has_equivocated: Dict[int, List[bool]] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class FastVote:
@@ -99,11 +104,23 @@ def process_block(state: State, block: Block) -> State:
 
         height = vote.target.height
         # Track votes for non-finalized heights
-        if vote.target.height not in state.height_to_target_hash:
+        if height not in state.height_to_target_hash:
             state.height_to_target_hash[height] = [None] * state.config.num_validators
+            state.has_equivocated[height] = [False] * state.config.num_validators
 
-        if state.height_to_target_hash[height][vote.validator_id] is None:
+        # Skip if already equivocated at this height
+        if state.has_equivocated[height][vote.validator_id]:
+            continue
+
+        prior = state.height_to_target_hash[height][vote.validator_id]
+        if prior is None:
             state.height_to_target_hash[height][vote.validator_id] = vote.target.hash
+        elif prior == vote.target.hash:
+            continue
+        elif prior != vote.target.hash:
+            # Equivocation: zero out vote and mark
+            state.height_to_target_hash[height][vote.validator_id] = None
+            state.has_equivocated[height][vote.validator_id] = True
 
         # Number of votes for this target hash at this height
         count_for_target = len(
@@ -113,34 +130,33 @@ def process_block(state: State, block: Block) -> State:
                 if h == vote.target.hash
             ]
         )
-
-        # Update per-height maximums if this target now has the highest count
-        previous_max = state.max_count_for_height.get(height, 0)
-        if count_for_target > previous_max:
-            state.max_count_for_height[height] = count_for_target
-            state.max_hash_for_height[height] = vote.target.hash
+        equiv_count = sum(state.has_equivocated[height])
+        count_for_target += equiv_count
 
         # Justify if 1/2 voted for a checkpoint
         is_known_target =  vote.target.hash == state.historical_block_hashes[vote.target.slot]
-        justification = is_known_target and count_for_target == (state.config.num_validators) // 2
+        justification_threshold = JUSTIFICATION_THRESHOLD_NUMERATOR * (state.config.num_validators) // JUSTIFICATION_THRESHOLD_DENOMINATOR
+        justification = is_known_target and count_for_target >= justification_threshold
         if justification and state.latest_justified.height < height:
             state.latest_justified = vote.target
 
         # Move to next height if there's a justification or a skip (allVotes - maxVotes >= 1/3)
         if state.height == height:
-            max_count = state.max_count_for_height[height]
-            total_count = len([h for h in state.height_to_target_hash[height] if h is not None])
-            skip = total_count - max_count >= (state.config.num_validators) // 3
+            hashes = [h for h in state.height_to_target_hash[height] if h is not None]
+            max_count = max((hashes.count(h) for h in hashes), default=0)
+            total_count = len(hashes) + equiv_count
+            skip_threshold = SKIP_THRESHOLD_NUMERATOR * (state.config.num_validators) // SKIP_THRESHOLD_DENOMINATOR
+            skip = total_count - max_count >= skip_threshold
             if justification or skip:
                 state.height += 1
             
         # Finalize if 5/6 voted for a checkpoint
-        if count_for_target == (5 * state.config.num_validators) // 6:
+        finalization_threshold = FINALIZATION_THRESHOLD_NUMERATOR * (state.config.num_validators) // FINALIZATION_THRESHOLD_DENOMINATOR
+        if count_for_target >= finalization_threshold:
             state.latest_finalized = vote.target
             # Clear vote tracking for this height once finalized
             del state.height_to_target_hash[height]
-            del state.max_count_for_height[height]
-            del state.max_hash_for_height[height]
+            del state.has_equivocated[height]
 
     return state
 
