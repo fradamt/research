@@ -19,17 +19,19 @@ class Config:
 class Checkpoint:
     hash: str
     slot: int
-    epoch: int
+    height: int
 
 # Blockchain state
 @dataclass
 class State:
     config: Config
-    latest_justified: Checkpoint
     latest_finalized: Checkpoint
+    latest_justified: Checkpoint
+    height: int
     historical_block_hashes: List[str] = field(default_factory=list)
-    justified_checkpoints: List[Checkpoint] = field(default_factory=list)
-    justifications: Dict[str, List[bool]] = field(default_factory=dict)
+    height_to_target_hash: Dict[str, List[Optional[str]]] = field(default_factory=dict)
+    max_count_for_height: Dict[str, int] = field(default_factory=dict)
+    max_hash_for_height: Dict[str, str] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class FastVote:
@@ -48,10 +50,9 @@ class PayloadVote(FastVote):
 @dataclass(frozen=True)
 class SlowVote:
     validator_id: int
-    finalized_epoch: int
-    source: Checkpoint
-    target: Checkpoint
-    head: str
+    epoch: int
+    target: Optional[Checkpoint]
+    confirmed: str
 @dataclass
 class GHOSTVote:
     validator_id: int
@@ -79,17 +80,6 @@ def compute_hash(obj: object):
 def slot_to_epoch(slot: int, config: Config) -> int:
     return slot // config.slots_per_epoch
 
-# Determines if slow voting should take place in a given epoch, based on an exponential backoff mechanism (with a cap).
-# A backoff interval is calculated based on the distance from the last finalized epoch, and slow voting should
-# only take place if the epoch is a multiple of the interval. Slow votes carry a `finalized_epoch`, and are invalid
-# if they violate this rule. The mechanism helps finality progress under high latency.
-def is_slow_voting_epoch(finalized_epoch: int, target_epoch: int):
-    max_backoff_interval = 2**MAX_BACKOFF_INTERVAL_EXPONENT
-    delta = (target_epoch - finalized_epoch) * (MAX_BACKOFF_INTERVAL_EXPONENT - 1)
-    delta = delta // (2 * max_backoff_interval)
-    backoff_interval = min(2**delta, max_backoff_interval)
-    return target_epoch % backoff_interval == 0
-
 # Given a state, output the new state after processing that block
 def process_block(state: State, block: Block) -> State:
     state = copy.deepcopy(state)
@@ -101,57 +91,58 @@ def process_block(state: State, block: Block) -> State:
     for vote in block.slow_votes:
 
         if (
-            not is_slow_voting_epoch(vote.finalized_epoch, vote.target.epoch)
-            or vote.source.epoch < state.latest_finalized.epoch
-            or vote.source not in state.justified_checkpoints
-            or vote.target in state.justified_checkpoints
-            or vote.target.hash != state.historical_block_hashes[vote.target.slot]
-            or vote.target.slot < vote.source.slot
-            or vote.target.epoch <= vote.source.epoch
+            vote.target is None
+            or vote.target.height <= state.latest_finalized.height
+            or vote.target.height > state.height
         ):
             continue
 
-        # Track attempts to justify new hashes
-        justification_key = compute_hash((vote.finalized_epoch, vote.source, vote.target))
-        if justification_key not in state.justifications:
-            state.justifications[justification_key] = [False] * state.config.num_validators
+        height = vote.target.height
+        # Track votes for non-finalized heights
+        if vote.target.height not in state.height_to_target_hash:
+            state.height_to_target_hash[height] = [None] * state.config.num_validators
 
-        if not state.justifications[justification_key][vote.validator_id]:
-            state.justifications[justification_key][vote.validator_id] = True
+        if state.height_to_target_hash[height][vote.validator_id] is None:
+            state.height_to_target_hash[height][vote.validator_id] = vote.target.hash
 
-        count = sum(state.justifications[justification_key])
+        # Number of votes for this target hash at this height
+        count_for_target = len(
+            [
+                h
+                for h in state.height_to_target_hash[height]
+                if h == vote.target.hash
+            ]
+        )
 
-        # If 2/3 voted for the same new valid hash to justify
-        if count == (2 * state.config.num_validators) // 3:
+        # Update per-height maximums if this target now has the highest count
+        previous_max = state.max_count_for_height.get(height, 0)
+        if count_for_target > previous_max:
+            state.max_count_for_height[height] = count_for_target
+            state.max_hash_for_height[height] = vote.target.hash
+
+        # Justify if 1/2 voted for a checkpoint
+        is_known_target =  vote.target.hash == state.historical_block_hashes[vote.target.slot]
+        justification = is_known_target and count_for_target == (state.config.num_validators) // 2
+        if justification and state.latest_justified.height < height:
             state.latest_justified = vote.target
-            state.justified_checkpoints.append(vote.target)
-            del state.justifications[justification_key]
 
-
-            # Finalization: if the target is the next valid slow voting
-            # epoch after the source, wrt the finalized epoch in the votes.
-            if not any(
-                is_slow_voting_epoch(vote.finalized_epoch, epoch)
-                for epoch in range(vote.source.epoch + 1, vote.target.epoch)
-            ):
-                state.latest_finalized = vote.source
-                # Prune old checkpoints
-                state.justified_checkpoints = [
-                    checkpoint for checkpoint in state.justified_checkpoints 
-                    if checkpoint.epoch >= state.latest_finalized.epoch
-                ]
+        # Move to next height if there's a justification or a skip (allVotes - maxVotes >= 1/3)
+        if state.height == height:
+            max_count = state.max_count_for_height[height]
+            total_count = len([h for h in state.height_to_target_hash[height] if h is not None])
+            skip = total_count - max_count >= (state.config.num_validators) // 3
+            if justification or skip:
+                state.height += 1
+            
+        # Finalize if 5/6 voted for a checkpoint
+        if count_for_target == (5 * state.config.num_validators) // 6:
+            state.latest_finalized = vote.target
+            # Clear vote tracking for this height once finalized
+            del state.height_to_target_hash[height]
+            del state.max_count_for_height[height]
+            del state.max_hash_for_height[height]
 
     return state
-
-# Get the highest-slot justified block that we know about
-def get_latest_justified_checkpoint(post_states: Dict[str, State]) -> Checkpoint:
-    latest = max(   
-        post_states.values(),
-        key=lambda s: s.latest_justified.epoch
-    )
-    return latest.latest_justified
-
-
 
 def get_fork_choice_head(blocks: Dict[str, Block],
         root: str,
@@ -171,19 +162,19 @@ def majority_fork_choice(blocks: Dict[str, Block],
     if len(slow_votes) == 0:
         return root
 
-    max_epoch = max(vote.target.epoch for vote in slow_votes)
+    max_epoch = max(vote.epoch for vote in slow_votes)
     long_expiration_ghost_votes = [
-        GHOSTVote(validator_id=vote.validator_id, head=vote.head)
+        GHOSTVote(validator_id=vote.validator_id, head=vote.confirmed)
         for vote in slow_votes
-        if vote.target.epoch >= max_epoch - EPOCHS_FOR_LONG_EXPIRATION_PERIOD
+        if vote.epoch >= max_epoch - EPOCHS_FOR_LONG_EXPIRATION_PERIOD
     ]
     majority_threshold = (len(long_expiration_ghost_votes)+1) // 2
     root = ghost_fork_choice(blocks, root, long_expiration_ghost_votes, min_score=majority_threshold + 1)
 
     short_expiration_ghost_votes = [
-        GHOSTVote(validator_id=vote.validator_id, head=vote.head)
+        GHOSTVote(validator_id=vote.validator_id, head=vote.confirmed)
         for vote in slow_votes
-        if vote.target.epoch >= max_epoch - EPOCHS_FOR_SHORT_EXPIRATION_PERIOD
+        if vote.epoch >= max_epoch - EPOCHS_FOR_SHORT_EXPIRATION_PERIOD
     ]
     majority_threshold = (len(short_expiration_ghost_votes)+1) // 2
     return ghost_fork_choice(blocks, root, short_expiration_ghost_votes, min_score=majority_threshold + 1)

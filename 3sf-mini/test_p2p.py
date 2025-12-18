@@ -1,8 +1,7 @@
 from re import S
 from consensus import (
-    State, Block, Config, Checkpoint,
-    get_latest_justified_checkpoint, get_fork_choice_head, majority_fork_choice,
-    compute_hash, is_slow_voting_epoch, slot_to_epoch
+    State, Block, Config, Checkpoint, majority_fork_choice,
+    compute_hash, slot_to_epoch
 )
 from p2p import Staker, P2PNetwork, SLOT_DURATION
 import random
@@ -106,7 +105,7 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     dfs(staker.genesis_hash, is_finalized=genesis_is_finalized)
 
     # Color blocks
-    justified_hash = get_latest_justified_checkpoint(staker.post_states).hash
+    justified_hash = staker.latest_justified.hash
     finalized_hash = staker.latest_finalized.hash
 
     node_colors = []
@@ -139,29 +138,28 @@ def plot_view(fig, ax, staker: Staker, title="Staker's View", prune: bool = True
     nx.draw_networkx_labels(G, pos, font_size=8)
 
     for vote in staker.latest_slow_votes.values():
-        if vote.target.hash[:8] not in pos:
+        if vote.confirmed[:8] not in pos:
             continue
         voter_node = f"v{vote.validator_id}"
         offset = (vote.validator_id - max_validator_id / 2) * 0.15
-        pos[voter_node] = (pos[vote.target.hash[:8]][0] + offset, pos[vote.target.hash[:8]][1] - 0.5)
+        pos[voter_node] = (pos[vote.confirmed[:8]][0] + offset, pos[vote.confirmed[:8]][1] - 0.5)
 
         G.add_node(voter_node, node_size=5)
-        G.add_edge(voter_node, vote.target.hash[:8])
+        G.add_edge(voter_node, vote.confirmed[:8])
 
         color = "orange"
         nx.draw_networkx_nodes(G, pos, nodelist=[voter_node], node_color=color, node_size=200)
-        nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.target.hash[:8])], edge_color=color,
+        nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.confirmed[:8])], edge_color=color,
                                style="dashed", arrowsize=8)
         # Only add target edge if target exists
-        G.add_edge(voter_node, vote.target.hash[:8])
-        nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.target.hash[:8])], edge_color="grey",
+        G.add_edge(voter_node, vote.confirmed[:8])
+        nx.draw_networkx_edges(G, pos, edgelist=[(voter_node, vote.confirmed[:8])], edge_color="grey",
                                 style="dashed", arrowsize=8)
             
         nx.draw_networkx_labels(G, pos, labels={voter_node: f"v{vote.validator_id}"}, font_size=6)
 
     # Add time and finality distance info
     current_slot = staker.get_current_slot()
-    finalized_epoch = staker.post_states[staker.head].latest_finalized.epoch
     finalized_slot = staker.post_states[staker.head].latest_finalized.slot
     distance_from_finality = current_slot - finalized_slot
     
@@ -217,10 +215,10 @@ if __name__ == '__main__':
     config = Config(num_validators=NUM_STAKERS, slots_per_epoch=args.slots_per_epoch)
     genesis_state = State(
         config=config,
-        latest_justified=Checkpoint(hash=ZERO_HASH, slot=0, epoch=0),
-        latest_finalized=Checkpoint(hash=ZERO_HASH, slot=0, epoch=0),
+        latest_justified=Checkpoint(hash=ZERO_HASH, slot=0, height=0),
+        latest_finalized=Checkpoint(hash=ZERO_HASH, slot=0, height=0),
+        height=1,
         historical_block_hashes=[ZERO_HASH],
-        justified_checkpoints=[Checkpoint(hash=ZERO_HASH, slot=0, epoch=0)],
     )
     genesis_block.state_root = compute_hash(genesis_state)
     genesis_hash = compute_hash(genesis_block)
@@ -298,18 +296,19 @@ if __name__ == '__main__':
             print(f"\n=== Time {time}, Slot {time // SLOT_DURATION + 2} === ")
             for staker in online_stakers:
                 head = staker.head
-                lje = staker.latest_justified.epoch
+                ljht = staker.latest_justified.height
                 ljh = staker.latest_justified.hash
-                lfe = staker.latest_finalized.epoch
+                lfht = staker.latest_finalized.height
                 lfh = staker.latest_finalized.hash
                 target = staker.get_target_checkpoint()
-                tbh = target.hash
-                tbs = target.slot
                 current_epoch = slot_to_epoch(time // SLOT_DURATION + 2, config)
-                if staker.should_slow_vote():
-                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} (Epoch: {lje}) | Finalized={lfh[:8]} (Epoch: {lfe}) | Slow voting epoch")
+                if target is not None:
+                    tbh = target.hash
+                    tbs = target.slot
+                    tbht = target.height
+                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) (Height: {tbht}) | Justified={ljh[:8]} (Height: {ljht}) | Finalized={lfh[:8]} (Height: {lfht})")
                 else:
-                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target={tbh[:8]} ({tbs}) | Justified={ljh[:8]} (Epoch: {lje}) | Finalized={lfh[:8]} (Epoch: {lfe}) | Not slow voting slot")
+                    print(f"Staker {staker.validator_id}: Head={head[:8]} ({staker.chain[head].slot}) | Target unset) | Justified={ljh[:8]} (Height: {ljht}) | Finalized={lfh[:8]} (Height: {lfht})")
         if not args.no_viz and time % 60 == 9:
             plot_view(fig, ax, stakers[0], "Chain View", prune=not args.no_pruning) # Pass prune correctly
 

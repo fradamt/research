@@ -6,8 +6,8 @@ from typing import List, Dict, Union, Set, Tuple
 import copy
 from consensus import (
     State, SlowVote, FastVote, BeaconVote, PayloadVote, Block, Checkpoint, majority_fork_choice,
-    process_block, get_latest_justified_checkpoint, get_fork_choice_head,
-    compute_hash, is_slow_voting_epoch, slot_to_epoch
+    process_block, get_fork_choice_head,
+    compute_hash, slot_to_epoch, MAX_BACKOFF_INTERVAL_EXPONENT
 )
 from collections import defaultdict
 
@@ -63,14 +63,22 @@ class Staker:
         self.network.register_staker(self)
 
     @property
+    def height(self):
+        return max(s.height for s in self.post_states.values())
+
+    @property
     def latest_justified(self):
-        return get_latest_justified_checkpoint(self.post_states)
+        latest = max(   
+            self.post_states.values(),
+            key=lambda s: s.latest_justified.height
+        )
+        return latest.latest_justified
 
     @property
     def latest_finalized(self):
         latest = max(   
             self.post_states.values(),
-            key=lambda s: s.latest_finalized.epoch
+            key=lambda s: s.latest_finalized.height
         )
         return latest.latest_finalized
 
@@ -114,10 +122,11 @@ class Staker:
             slow_votes=self.latest_slow_votes.values(),
         )
         head_state = self.post_states[self.head]
-        finalized_epoch = head_state.latest_finalized.epoch
+        finalized_epoch = slot_to_epoch(head_state.latest_finalized.slot, self.config)
+        finalized_height = head_state.latest_finalized.height
         slow_votes_to_include = [
                 vote for (_, epoch), vote in self.slow_votes.items()
-                if epoch > finalized_epoch
+                if epoch > finalized_epoch and (vote.target is None or vote.target.height > finalized_height)
             ]
         # Include all payload votes (both first-seen and equivocating)
         payload_votes_to_include = (
@@ -161,10 +170,9 @@ class Staker:
     def slow_vote(self):
         vote =  SlowVote(
             validator_id=self.validator_id,
-            finalized_epoch=self.latest_finalized.epoch,
-            source=self.latest_justified,
+            epoch=self.get_current_epoch(),
             target=self.get_target_checkpoint(),
-            head=self.confirmed_hash
+            confirmed=self.confirmed_hash
         )
         
         self.network.submit(vote, self.validator_id)
@@ -253,11 +261,9 @@ class Staker:
     def get_payload_votes_for_fork_choice(self):
         """Returns payload votes excluding those from equivocating validators."""
         return [vote for vid, vote in self.payload_votes.items() if vid not in self.payload_vote_equivocations]
-        
+
     def should_slow_vote(self):
-        first_slot_of_epoch = self.get_current_slot() % self.config.slots_per_epoch == 0
-        slow_voting_epoch = is_slow_voting_epoch(self.latest_finalized.epoch, self.get_current_epoch())
-        return first_slot_of_epoch and slow_voting_epoch
+        return self.get_current_slot() % self.config.slots_per_epoch == 0
 
     def get_ancestor_at_slot(self, hash: str, slot: int):
         genesis_slot = self.chain[self.genesis_hash].slot
@@ -267,8 +273,13 @@ class Staker:
         return compute_hash(current_block)
 
     def get_target_checkpoint(self):
-        if self.latest_justified.epoch + 1 == self.get_current_epoch():
-            target_hash = self.confirmed_hash
+        backoff_interval = self.compute_backoff_interval()
+        if not self.get_current_epoch() % backoff_interval == 0:
+            return None
+        # If the backoff is not active (interval is 1), use the confirmed block as target
+        if backoff_interval == 1:
+            target_hash = self.confirmed_hash 
+        # If the backoff is active, use the k-deep block as target
         else:
             majority_hash = majority_fork_choice(
                 self.chain,
@@ -283,9 +294,20 @@ class Staker:
         return Checkpoint(
             hash=target_hash,
             slot=target_block.slot,
-            epoch=self.get_current_epoch(),
+            height=self.height,
         )
 
+    # A backoff interval is calculated based on an exponential backoff mechanism (with a cap),
+    # using the distance from the last finalized epoch. The target should be set only if the epoch
+    # is a multiple of the interval. The mechanism helps finality progress under high latency.
+    def compute_backoff_interval(self):
+        epoch = self.get_current_epoch()
+        finalized_epoch = slot_to_epoch(self.latest_finalized.slot, self.config)
+        max_backoff_interval = 2**MAX_BACKOFF_INTERVAL_EXPONENT
+        delta = (epoch - finalized_epoch) * (MAX_BACKOFF_INTERVAL_EXPONENT - 1)
+        delta = delta // (2 * max_backoff_interval)
+        return min(2**delta, max_backoff_interval) 
+        
     def update_confirmed(self, new_confirmed_hash: str):
         new_confirmed_block = self.chain[new_confirmed_hash]
         confirmed_block = self.chain[self.confirmed_hash]
@@ -345,14 +367,20 @@ class Staker:
 
     def receive_slow_vote(self, slow_vote: SlowVote):
         # Ignore votes from future epochs
-        if slow_vote.target.epoch > self.get_current_epoch():
+        if slow_vote.epoch > self.get_current_epoch():
             return
         # Ignore votes from equivocators
         if slow_vote.validator_id in self.equivocators:
             return
 
-        if slow_vote.target.hash in self.chain:
-            vote_epoch = slow_vote.target.epoch
+        
+        if slow_vote.confirmed in self.chain:
+            # if set, target must be an ancestor of confirmed
+            if slow_vote.target is not None: 
+                if self.get_ancestor_at_slot(slow_vote.confirmed, slow_vote.target.slot) != slow_vote.target.hash:
+                    return
+
+            vote_epoch = slow_vote.epoch
             vote_key = (slow_vote.validator_id, vote_epoch)
             
             # Already have a vote for this epoch, either already seen or an equivocation
@@ -368,11 +396,11 @@ class Staker:
             # Update latest slow vote if this is a newer vote
             if (
                 slow_vote.validator_id not in self.latest_slow_votes
-                or vote_epoch > self.latest_slow_votes[slow_vote.validator_id].target.epoch
+                or vote_epoch > self.latest_slow_votes[slow_vote.validator_id].epoch
             ):
                 self.latest_slow_votes[slow_vote.validator_id] = slow_vote
         else:
-            self.dependencies.setdefault(slow_vote.target.hash, []).append(slow_vote)
+            self.dependencies.setdefault(slow_vote.confirmed, []).append(slow_vote)
 
 
                     
