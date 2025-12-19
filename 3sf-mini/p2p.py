@@ -7,7 +7,7 @@ import copy
 from consensus import (
     State, SlowVote, FastVote, BeaconVote, PayloadVote, Block, Checkpoint, majority_fork_choice,
     process_block, get_fork_choice_head,
-    compute_hash, slot_to_epoch, MAX_BACKOFF_INTERVAL_EXPONENT
+    compute_hash, slot_to_epoch
 )
 from collections import defaultdict
 
@@ -16,6 +16,7 @@ ConsensusObject = Union[Block, BeaconVote, PayloadVote, SlowVote]
 SLOT_DURATION = 10  # time units
 ZERO_HASH = '0'*64
 KAPPA = 32
+MAX_BACKOFF_INTERVAL_EXPONENT = 4
 
 
 
@@ -274,12 +275,13 @@ class Staker:
 
     def get_target_checkpoint(self):
         backoff_interval = self.compute_backoff_interval()
+        # Do not set a target if the current epoch is not a multiple of the backoff interval.
         if not self.get_current_epoch() % backoff_interval == 0:
             return None
         # If the backoff is not active (interval is 1), use the confirmed block as target
         if backoff_interval == 1:
             target_hash = self.confirmed_hash 
-        # If the backoff is active, use the k-deep block as target
+        # If the backoff is active, fallback touse the k-deep block as target
         else:
             majority_hash = majority_fork_choice(
                 self.chain,
@@ -304,8 +306,12 @@ class Staker:
         epoch = self.get_current_epoch()
         finalized_epoch = slot_to_epoch(self.latest_finalized.slot, self.config)
         max_backoff_interval = 2**MAX_BACKOFF_INTERVAL_EXPONENT
+        # if backoff_interval = max_backoff_interval and we finalize in a single "backoff epoch",
+        # i.e. epoch - finalized_epoch = max_backoff_interval, we should scale back the backoff,
+        # because we finalized as soon as possible given the backoff. In that case,
+        # delta = MAX_BACKOFF_INTERVAL_EXPONENT - 1, so we move to backoff_interval = 2**(MAX_BACKOFF_INTERVAL_EXPONENT - 1)
         delta = (epoch - finalized_epoch) * (MAX_BACKOFF_INTERVAL_EXPONENT - 1)
-        delta = delta // (2 * max_backoff_interval)
+        delta = delta // max_backoff_interval
         return min(2**delta, max_backoff_interval) 
         
     def update_confirmed(self, new_confirmed_hash: str):

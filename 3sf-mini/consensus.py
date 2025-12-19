@@ -5,7 +5,6 @@ import json
 import copy
 
 ZERO_HASH = '0'*64
-MAX_BACKOFF_INTERVAL_EXPONENT = 4
 EPOCHS_FOR_LONG_EXPIRATION_PERIOD = 64
 EPOCHS_FOR_SHORT_EXPIRATION_PERIOD = 2
 FINALIZATION_THRESHOLD_NUMERATOR = 5
@@ -131,6 +130,7 @@ def process_block(state: State, block: Block) -> State:
             ]
         )
         equiv_count = sum(state.has_equivocated[height])
+        # count an equivocation as a vote for any target
         count_for_target += equiv_count
 
         # Justify if 1/2 voted for a checkpoint
@@ -143,8 +143,12 @@ def process_block(state: State, block: Block) -> State:
         # Move to next height if there's a justification or a skip (allVotes - maxVotes >= 1/3)
         if state.height == height:
             hashes = [h for h in state.height_to_target_hash[height] if h is not None]
-            max_count = max((hashes.count(h) for h in hashes), default=0)
+            # only count equivocations towards total_count, not max_count. This counts the
+            # validator's vote in the most favorable way for making progress (moving to next height), 
+            # which could also be the case if we received a single vote from this validator, for a
+            # target other than the one with max votes. This could also be what happens on another branch.
             total_count = len(hashes) + equiv_count
+            max_count = max((hashes.count(h) for h in hashes), default=0)
             skip_threshold = SKIP_THRESHOLD_NUMERATOR * (state.config.num_validators) // SKIP_THRESHOLD_DENOMINATOR
             skip = total_count - max_count >= skip_threshold
             if justification or skip:
@@ -179,6 +183,8 @@ def majority_fork_choice(blocks: Dict[str, Block],
         return root
 
     max_epoch = max(vote.epoch for vote in slow_votes)
+    # A prefix is determined using votes from a long expiration period, to
+    # so that asynchrony resilience holds for long periods of asynchrony.
     long_expiration_ghost_votes = [
         GHOSTVote(validator_id=vote.validator_id, head=vote.confirmed)
         for vote in slow_votes
@@ -187,6 +193,11 @@ def majority_fork_choice(blocks: Dict[str, Block],
     majority_threshold = (len(long_expiration_ghost_votes)+1) // 2
     root = ghost_fork_choice(blocks, root, long_expiration_ghost_votes, min_score=majority_threshold + 1)
 
+    # Starting from the stable prefix determined by votes from the long 
+    # expiration period, we determine a new prefix that extends it, using
+    # votes from a shorter expiration period. If many validators go offline,
+    # this extension still makes progress shortly after, because stale votes
+    # quickly expire, allowing the majority threshold to be met. 
     short_expiration_ghost_votes = [
         GHOSTVote(validator_id=vote.validator_id, head=vote.confirmed)
         for vote in slow_votes
