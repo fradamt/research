@@ -117,7 +117,7 @@ def process_block(state: State, block: Block) -> State:
         elif prior == vote.target.hash:
             continue
         elif prior != vote.target.hash:
-            # Equivocation: zero out vote and mark
+            # Equivocation: zero out vote and mark the equivocation
             state.height_to_target_hash[height][vote.validator_id] = None
             state.has_equivocated[height][vote.validator_id] = True
 
@@ -129,9 +129,9 @@ def process_block(state: State, block: Block) -> State:
                 if h == vote.target.hash
             ]
         )
-        equiv_count = sum(state.has_equivocated[height])
         # count an equivocation as a vote for any target
-        count_for_target += equiv_count
+        equivocation_count = sum(state.has_equivocated[height])
+        count_for_target += equivocation_count
 
         # Justify if 1/2 voted for a checkpoint
         is_known_target =  vote.target.hash == state.historical_block_hashes[vote.target.slot]
@@ -147,7 +147,7 @@ def process_block(state: State, block: Block) -> State:
             # validator's vote in the most favorable way for making progress (moving to next height), 
             # which could also be the case if we received a single vote from this validator, for a
             # target other than the one with max votes. This could also be what happens on another branch.
-            total_count = len(hashes) + equiv_count
+            total_count = len(hashes) + equivocation_count
             max_count = max((hashes.count(h) for h in hashes), default=0)
             skip_threshold = SKIP_THRESHOLD_NUMERATOR * (state.config.num_validators) // SKIP_THRESHOLD_DENOMINATOR
             skip = total_count - max_count >= skip_threshold

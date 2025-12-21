@@ -60,6 +60,8 @@ class Staker:
         self.head = self.genesis_hash
         # Whether to use k-th ancestor backoff
         self.use_backoff = use_backoff
+        # Last height this node voted for (to prevent duplicate height votes)
+        self.last_voted_height: int = 0
         # Join the p2p network
         self.network.register_staker(self)
 
@@ -169,13 +171,15 @@ class Staker:
 
 
     def slow_vote(self):
+        target = self.get_target_checkpoint()
         vote =  SlowVote(
             validator_id=self.validator_id,
             epoch=self.get_current_epoch(),
-            target=self.get_target_checkpoint(),
+            target=target,
             confirmed=self.confirmed_hash
         )
-        
+        if target is not None:
+            self.last_voted_height = target.height
         self.network.submit(vote, self.validator_id)
 
     def fast_confirm(self):
@@ -274,6 +278,9 @@ class Staker:
         return compute_hash(current_block)
 
     def get_target_checkpoint(self):
+        # Do not set a target if you have already voted at this height
+        if self.last_voted_height == self.height:
+            return None
         backoff_interval = self.compute_backoff_interval()
         # Do not set a target if the current epoch is not a multiple of the backoff interval.
         if not self.get_current_epoch() % backoff_interval == 0:
