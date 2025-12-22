@@ -22,7 +22,7 @@ MAX_BACKOFF_INTERVAL_EXPONENT = 4
 
 # A basic Staker node implementation
 class Staker:
-    def __init__(self, validator_id: int, network: 'P2PNetwork', genesis_block: Block, genesis_state: State, use_backoff: bool = True):
+    def __init__(self, validator_id: int, network: 'P2PNetwork', genesis_block: Block, genesis_state: State):
         # This node's validator ID
         self.validator_id = validator_id
         # Hook to the p2p network
@@ -58,8 +58,6 @@ class Staker:
         self.confirmed_hash: str = self.genesis_hash
         # Head of the chain
         self.head = self.genesis_hash
-        # Whether to use k-th ancestor backoff
-        self.use_backoff = use_backoff
         # Last height this node voted for (to prevent duplicate height votes)
         self.last_voted_height: int = 0
         # Join the p2p network

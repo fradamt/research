@@ -192,9 +192,7 @@ def plot_progression(confirmed_slots, justified_slots, finalized_slots, canonica
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run a P2P network simulation')
-    parser.add_argument('--no-backoff', action='store_true', help='Disable k-th ancestor backoff')
     parser.add_argument('--no-pruning', action='store_true', help='Prune conflicting branches when finalized')
-    parser.add_argument('--max-backoff', type=int, default=8, help='Maximum checkpoint interval for backoff')
     parser.add_argument('--latency', type=int, help='latency to use')
     parser.add_argument('--time', type=int, default=1000, help='Number of time steps to run')
     parser.add_argument('--no-viz', action='store_true', help='Disable interactive graph visualization')
@@ -238,7 +236,7 @@ if __name__ == '__main__':
     
 
     network = P2PNetwork(latency_func)
-    stakers = [Staker(i, network, genesis_block, genesis_state, use_backoff=not args.no_backoff) for i in range(NUM_STAKERS)]
+    stakers = [Staker(i, network, genesis_block, genesis_state) for i in range(NUM_STAKERS)]
 
     # Initialize all stakers with genesis
     for staker in stakers:
